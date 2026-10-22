@@ -5,8 +5,8 @@ use eframe::egui;
 
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
-    bt1886_params, bt1886_target_luminance, generate_profile_from_measurements,
-    CalibrationMeasurements,
+    bt1886_params, eotf_target_luminance, generate_profile_from_measurements,
+    CalibrationMeasurements, EotfConfig,
 };
 
 /// Time to let the display panel settle on a new color patch before triggering the sensor read.
@@ -18,38 +18,69 @@ pub fn run_gui() -> eframe::Result<()> {
             .with_app_id("yutani.calibration")
             .with_inner_size([960.0, 680.0])
             .with_fullscreen(false),
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Dark,
         ..Default::default()
     };
 
     eframe::run_native(
-        "YUTANI // MU-TH-UR 6000 COLORIMETRY SUBSYSTEM",
+        "YUTANI // COLORIMETRY SUBSYSTEM",
         options,
         Box::new(|cc| {
-            let mut style = egui::Style::default();
-            let bg_black = egui::Color32::from_rgb(8, 8, 8);
-            let amber = egui::Color32::from_rgb(255, 180, 40);
-            let dark_amber = egui::Color32::from_rgb(45, 28, 8);
-            let active_amber = egui::Color32::from_rgb(85, 52, 12);
-
-            style.visuals.dark_mode = true;
-            style.visuals.window_fill = bg_black;
-            style.visuals.panel_fill = bg_black;
-            style.visuals.override_text_color = Some(amber);
-            style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, amber);
-            style.visuals.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 60, 15));
-            style.visuals.widgets.inactive.bg_fill = dark_amber;
-            style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, amber);
-            style.visuals.widgets.hovered.bg_fill = active_amber;
-            style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, amber);
-            style.visuals.widgets.active.bg_fill = amber;
-            style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, bg_black);
-
-            cc.egui_ctx.set_style(style);
-
+            configure_yutani_theme(&cc.egui_ctx);
             Box::new(YutaniApp::new())
         }),
     )
+}
+
+fn configure_yutani_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let bg_black = egui::Color32::from_rgb(8, 8, 8);
+    let panel_dark = egui::Color32::from_rgb(14, 12, 8);
+    let amber = egui::Color32::from_rgb(255, 180, 40);
+    let dim_amber = egui::Color32::from_rgb(140, 95, 20);
+    let dark_amber = egui::Color32::from_rgb(45, 28, 8);
+    let hover_amber = egui::Color32::from_rgb(85, 52, 12);
+
+    style.override_font_id = Some(egui::FontId::monospace(14.0));
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = bg_black;
+    visuals.panel_fill = panel_dark;
+    visuals.faint_bg_color = bg_black;
+    visuals.extreme_bg_color = bg_black;
+    visuals.override_text_color = Some(amber);
+    visuals.window_rounding = egui::Rounding::ZERO;
+    visuals.menu_rounding = egui::Rounding::ZERO;
+
+    visuals.widgets.noninteractive.bg_fill = bg_black;
+    visuals.widgets.noninteractive.weak_bg_fill = bg_black;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, dim_amber);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, amber);
+    visuals.widgets.noninteractive.rounding = egui::Rounding::ZERO;
+
+    visuals.widgets.inactive.bg_fill = dark_amber;
+    visuals.widgets.inactive.weak_bg_fill = dark_amber;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, amber);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, amber);
+    visuals.widgets.inactive.rounding = egui::Rounding::ZERO;
+
+    visuals.widgets.hovered.bg_fill = hover_amber;
+    visuals.widgets.hovered.weak_bg_fill = hover_amber;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5_f32, amber);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, amber);
+    visuals.widgets.hovered.rounding = egui::Rounding::ZERO;
+
+    visuals.widgets.active.bg_fill = amber;
+    visuals.widgets.active.weak_bg_fill = amber;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, amber);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, bg_black);
+    visuals.widgets.active.rounding = egui::Rounding::ZERO;
+
+    style.visuals = visuals;
+    ctx.set_style(style);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,7 +177,9 @@ struct YutaniApp {
     session: Option<SpyderSession>,
     status_log: String,
     last_single_read: Option<XyzReading>,
+    eotf: EotfConfig,
     phase: AppPhase,
+    theme_applied: bool,
 }
 
 impl YutaniApp {
@@ -155,7 +188,9 @@ impl YutaniApp {
             session: None,
             status_log: String::from("SYSTEM READY. INITIALISING INSTRUMENT LINK..."),
             last_single_read: None,
+            eotf: EotfConfig::default(),
             phase: AppPhase::Dashboard,
+            theme_applied: false,
         };
         app.connect_sensor();
         app
@@ -222,7 +257,7 @@ impl YutaniApp {
             grayscale,
         };
 
-        match generate_profile_from_measurements(&measurements) {
+        match generate_profile_from_measurements(&measurements, self.eotf) {
             Ok(saved_paths) => {
                 self.status_log = format!(
                     "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S)",
@@ -243,6 +278,11 @@ impl YutaniApp {
 
 impl eframe::App for YutaniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.theme_applied {
+            configure_yutani_theme(ctx);
+            self.theme_applied = true;
+        }
+
         // Global ESC key aborts fullscreen placement or measurement
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if !matches!(self.phase, AppPhase::Dashboard) {
@@ -252,16 +292,19 @@ impl eframe::App for YutaniApp {
             }
         }
 
+        let current_eotf = self.eotf;
+
         match &mut self.phase {
             AppPhase::Dashboard => {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("YUTANI CORP // MU-TH-UR 6000 COLORIMETRY SUBSYSTEM");
-                    ui.label("WEYLAND-YUTANI DISPLAY PROFILER // BUILD BETTER WORLDS");
+                    ui.heading("YUTANI CORP // WAYLAND COLORIMETRY SUBSYSTEM");
+                    ui.label("YUTANI DISPLAY PROFILER // BUILD BETTER COLORS");
                     ui.separator();
 
                     ui.add_space(8.0);
                     ui.label("DISPLAY TARGET : ASUS ProArt PA32UCDM");
-                    ui.label("TARGET EOTF    : ITU-R BT.1886 (γ = 2.40 + Black Level Compensation)");
+                    ui.label(format!("TARGET EOTF    : {}", self.eotf.display_label()));
+                    ui.label(format!("OUTPUT PROFILE : {}", self.eotf.filename_slug()));
                     ui.label("TARGET WHITE   : CIE D65 (x = 0.3127, y = 0.3290)");
                     ui.label(format!("SENSOR STATUS  : {}", self.status_log));
 
@@ -273,7 +316,72 @@ impl eframe::App for YutaniApp {
                         ));
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label("SELECT TARGET GAMMA / EOTF CURVE:");
+                    ui.horizontal_wrapped(|ui| {
+                        let is_bt1886_24 = matches!(self.eotf, EotfConfig::Bt1886 { gamma } if (gamma - 2.4).abs() < 0.005);
+                        if ui.selectable_label(is_bt1886_24, " [ BT.1886 (γ 2.40) ] ").clicked() {
+                            self.eotf = EotfConfig::Bt1886 { gamma: 2.4 };
+                        }
+
+                        let is_bt1886_22 = matches!(self.eotf, EotfConfig::Bt1886 { gamma } if (gamma - 2.2).abs() < 0.005);
+                        if ui.selectable_label(is_bt1886_22, " [ BT.1886 (γ 2.20) ] ").clicked() {
+                            self.eotf = EotfConfig::Bt1886 { gamma: 2.2 };
+                        }
+
+                        let is_pure_22 = matches!(self.eotf, EotfConfig::PurePower { gamma } if (gamma - 2.2).abs() < 0.005);
+                        if ui.selectable_label(is_pure_22, " [ PURE GAMMA 2.20 ] ").clicked() {
+                            self.eotf = EotfConfig::PurePower { gamma: 2.2 };
+                        }
+
+                        let is_pure_24 = matches!(self.eotf, EotfConfig::PurePower { gamma } if (gamma - 2.4).abs() < 0.005);
+                        if ui.selectable_label(is_pure_24, " [ PURE GAMMA 2.40 ] ").clicked() {
+                            self.eotf = EotfConfig::PurePower { gamma: 2.4 };
+                        }
+
+                        let is_pure_26 = matches!(self.eotf, EotfConfig::PurePower { gamma } if (gamma - 2.6).abs() < 0.005);
+                        if ui.selectable_label(is_pure_26, " [ DCI GAMMA 2.60 ] ").clicked() {
+                            self.eotf = EotfConfig::PurePower { gamma: 2.6 };
+                        }
+
+                        let is_srgb = matches!(self.eotf, EotfConfig::Srgb);
+                        if ui.selectable_label(is_srgb, " [ sRGB PIECEWISE ] ").clicked() {
+                            self.eotf = EotfConfig::Srgb;
+                        }
+                    });
+
+                    // Fine-grained custom gamma slider & black-compensation mode toggle
+                    if !matches!(self.eotf, EotfConfig::Srgb) {
+                        let mut g = self.eotf.gamma_value();
+                        let mut use_bt1886 = matches!(self.eotf, EotfConfig::Bt1886 { .. });
+                        ui.horizontal(|ui| {
+                            ui.label("CUSTOM GAMMA (γ):");
+                            let slider_changed = ui
+                                .add(
+                                    egui::Slider::new(&mut g, 1.60..=2.80)
+                                        .step_by(0.05)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                            let mode_changed = ui
+                                .checkbox(
+                                    &mut use_bt1886,
+                                    "BT.1886 Black-Level Lift Compensation",
+                                )
+                                .changed();
+                            if slider_changed || mode_changed {
+                                self.eotf = if use_bt1886 {
+                                    EotfConfig::Bt1886 { gamma: g }
+                                } else {
+                                    EotfConfig::PurePower { gamma: g }
+                                };
+                            }
+                        });
+                    }
+
+                    ui.add_space(12.0);
+                    ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button(" [ RE-SCAN USB INSTRUMENT ] ").clicked() {
                             self.connect_sensor();
@@ -475,18 +583,19 @@ impl eframe::App for YutaniApp {
             } => {
                 let mut back_to_dash = false;
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("YUTANI CORP // BT.1886 CALIBRATION REPORT");
+                    ui.heading("YUTANI CORP // CALIBRATION TELEMETRY REPORT");
                     ui.separator();
 
                     let lw = measurements.white.y;
                     let lb = measurements.black.y;
                     let contrast = if lb > 1e-5 { lw / lb } else { 0.0 };
-                    let (a, b) = bt1886_params(lw, lb);
+                    let (a, b) = bt1886_params(lw, lb, current_eotf.gamma_value());
                     let (wx, wy, _) = measurements.white.to_xyy();
                     let (rx, ry, _) = measurements.red.to_xyy();
                     let (gx, gy, _) = measurements.green.to_xyy();
                     let (bx, by, _) = measurements.blue.to_xyy();
 
+                    ui.label(format!("TARGET EOTF     : {}", current_eotf.display_label()));
                     ui.label(format!(
                         "PEAK WHITE (Lw) : {:.3} cd/m²  (CIE xy = {:.4}, {:.4})",
                         lw, wx, wy
@@ -497,10 +606,12 @@ impl eframe::App for YutaniApp {
                     } else {
                         ui.label("CONTRAST RATIO  : ∞ : 1 (OLED Zero-Black)");
                     }
-                    ui.label(format!(
-                        "BT.1886 PARAMS  : a = {:.4}, b = {:.6} (γ = 2.40)",
-                        a, b
-                    ));
+                    if let EotfConfig::Bt1886 { gamma } = current_eotf {
+                        ui.label(format!(
+                            "BT.1886 PARAMS  : a = {:.4}, b = {:.6} (γ = {:.2})",
+                            a, b, gamma
+                        ));
+                    }
                     ui.label(format!(
                         "PRIMARIES (xy)  : R({:.4}, {:.4})  G({:.4}, {:.4})  B({:.4}, {:.4})",
                         rx, ry, gx, gy, bx, by
@@ -508,15 +619,15 @@ impl eframe::App for YutaniApp {
 
                     ui.add_space(10.0);
                     ui.separator();
-                    ui.label("GRAYSCALE EOTF TRACKING (MEASURED vs. BT.1886 TARGET):");
+                    ui.label("GRAYSCALE EOTF TRACKING (MEASURED vs. TARGET):");
                     egui::ScrollArea::vertical()
                         .max_height(240.0)
                         .show(ui, |ui| {
                             for (v, reading) in &measurements.grayscale {
-                                let target_y = bt1886_target_luminance(*v, lw, lb);
+                                let target_y = eotf_target_luminance(*v, lw, lb, current_eotf);
                                 let (gx, gy, meas_y) = reading.to_xyy();
                                 ui.monospace(format!(
-                                    "  {:>3.0}% | Meas: {:>7.3} cd/m² | BT.1886 Target: {:>7.3} cd/m² | xy: ({:.4}, {:.4})",
+                                    "  {:>3.0}% | Meas: {:>7.3} cd/m² | Target: {:>7.3} cd/m² | xy: ({:.4}, {:.4})",
                                     v * 100.0,
                                     meas_y,
                                     target_y,

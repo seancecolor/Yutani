@@ -4,6 +4,56 @@ use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
 
 use crate::driver::spyder::XyzReading;
 
+/// Electro-Optical Transfer Function (EOTF) / Gamma mode for calibration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EotfConfig {
+    /// ITU-R BT.1886 black-level compensated power law (standard γ = 2.40, or custom γ).
+    Bt1886 { gamma: f64 },
+    /// Pure power-law gamma curve `L_norm = V^gamma` (e.g. 2.20, 2.40, 2.60).
+    PurePower { gamma: f64 },
+    /// IEC 61966-2-1 sRGB piecewise transfer function.
+    Srgb,
+}
+
+impl Default for EotfConfig {
+    fn default() -> Self {
+        Self::Bt1886 { gamma: 2.4 }
+    }
+}
+
+impl EotfConfig {
+    pub fn gamma_value(self) -> f64 {
+        match self {
+            Self::Bt1886 { gamma } | Self::PurePower { gamma } => gamma,
+            Self::Srgb => 2.2,
+        }
+    }
+
+    pub fn display_label(self) -> String {
+        match self {
+            Self::Bt1886 { gamma } => {
+                format!("ITU-R BT.1886 (γ = {gamma:.2} + Black Level Compensation)")
+            }
+            Self::PurePower { gamma } => format!("Pure Power Law (γ = {gamma:.2})"),
+            Self::Srgb => String::from("IEC 61966-2-1 sRGB Piecewise (~γ 2.20)"),
+        }
+    }
+
+    pub fn filename_slug(self) -> String {
+        match self {
+            Self::Bt1886 { gamma } => {
+                if (gamma - 2.4).abs() < 0.005 {
+                    String::from("Yutani_PA32UCDM_BT1886.icc")
+                } else {
+                    format!("Yutani_PA32UCDM_BT1886_G{gamma:.2}.icc")
+                }
+            }
+            Self::PurePower { gamma } => format!("Yutani_PA32UCDM_Gamma_{gamma:.2}.icc"),
+            Self::Srgb => String::from("Yutani_PA32UCDM_sRGB.icc"),
+        }
+    }
+}
+
 /// Complete set of patch measurements captured during a calibration run.
 #[derive(Clone, Debug)]
 pub struct CalibrationMeasurements {
@@ -16,29 +66,53 @@ pub struct CalibrationMeasurements {
     pub grayscale: Vec<(f64, XyzReading)>,
 }
 
-/// Compute BT.1886 parameters `(a, b)` for a given white and black luminance (cd/m²).
-pub fn bt1886_params(white_lum: f64, black_lum: f64) -> (f64, f64) {
-    let gamma = 2.4;
+/// Compute BT.1886 parameters `(a, b)` for a given white/black luminance (cd/m²) and gamma.
+pub fn bt1886_params(white_lum: f64, black_lum: f64, gamma: f64) -> (f64, f64) {
+    let g = gamma.clamp(1.0, 4.0);
     let lw = white_lum.max(1.0);
     let lb = black_lum.clamp(0.0, lw * 0.2);
-    let lw_pow = lw.powf(1.0 / gamma);
-    let lb_pow = lb.powf(1.0 / gamma);
+    let lw_pow = lw.powf(1.0 / g);
+    let lb_pow = lb.powf(1.0 / g);
     let denom = (lw_pow - lb_pow).max(1e-6);
-    let a = denom.powf(gamma);
+    let a = denom.powf(g);
     let b = lb_pow / denom;
     (a, b)
 }
 
-/// Evaluate target BT.1886 luminance (in cd/m²) at input signal `v` in `[0.0, 1.0]`.
-pub fn bt1886_target_luminance(v: f64, white_lum: f64, black_lum: f64) -> f64 {
-    let gamma = 2.4;
-    let (a, b) = bt1886_params(white_lum, black_lum);
-    let v_plus_b = (v.clamp(0.0, 1.0) + b).max(0.0);
-    a * v_plus_b.powf(gamma)
+/// Evaluate target luminance (in cd/m²) at input signal `v` in `[0.0, 1.0]` for the chosen EOTF.
+pub fn eotf_target_luminance(
+    v: f64,
+    white_lum: f64,
+    black_lum: f64,
+    eotf: EotfConfig,
+) -> f64 {
+    let v = v.clamp(0.0, 1.0);
+    let lw = white_lum.max(1.0);
+    let lb = black_lum.clamp(0.0, lw * 0.2);
+    match eotf {
+        EotfConfig::Bt1886 { gamma } => {
+            let g = gamma.clamp(1.0, 4.0);
+            let (a, b) = bt1886_params(lw, lb, g);
+            let v_plus_b = (v + b).max(0.0);
+            a * v_plus_b.powf(g)
+        }
+        EotfConfig::PurePower { gamma } => {
+            let g = gamma.clamp(1.0, 4.0);
+            lb + (lw - lb) * v.powf(g)
+        }
+        EotfConfig::Srgb => {
+            let lin = if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            };
+            lb + (lw - lb) * lin
+        }
+    }
 }
 
-/// Build the 1024-point 16-bit Tone Reproduction Curve for BT.1886.
-fn build_bt1886_lut(white_lum: f64, black_lum: f64) -> Vec<u16> {
+/// Build the 1024-point 16-bit Tone Reproduction Curve for the selected EOTF.
+fn build_eotf_lut(white_lum: f64, black_lum: f64, eotf: EotfConfig) -> Vec<u16> {
     let lw = white_lum.max(1.0);
     let lb = black_lum.clamp(0.0, lw * 0.2);
     let span = (lw - lb).max(1e-6);
@@ -46,7 +120,7 @@ fn build_bt1886_lut(white_lum: f64, black_lum: f64) -> Vec<u16> {
     let mut curve_data = Vec::with_capacity(1024);
     for i in 0..1024 {
         let v = i as f64 / 1023.0;
-        let l = bt1886_target_luminance(v, lw, lb);
+        let l = eotf_target_luminance(v, lw, lb, eotf);
         let l_norm = (l - lb) / span;
         let u16_val = (l_norm.clamp(0.0, 1.0) * 65535.0).round() as u16;
         curve_data.push(u16_val);
@@ -54,11 +128,11 @@ fn build_bt1886_lut(white_lum: f64, black_lum: f64) -> Vec<u16> {
     curve_data
 }
 
-/// Generate a baseline BT.1886 ICC profile from white/black luminance values.
-pub fn generate_bt1886_profile(white_lum: f64, black_lum: f64) {
-    let curve_data = build_bt1886_lut(white_lum, black_lum);
-    let bt1886_curve = ToneCurve::new_tabulated(&curve_data);
-    let curves = [&bt1886_curve, &bt1886_curve, &bt1886_curve];
+/// Generate a baseline ICC profile from white/black luminance values and EOTF configuration.
+pub fn generate_bt1886_profile_with_eotf(white_lum: f64, black_lum: f64, eotf: EotfConfig) {
+    let curve_data = build_eotf_lut(white_lum, black_lum, eotf);
+    let trc_curve = ToneCurve::new_tabulated(&curve_data);
+    let curves = [&trc_curve, &trc_curve, &trc_curve];
 
     // BT.709 primaries used as baseline when unmeasured
     let mut profile = Profile::new_rgb(
@@ -72,16 +146,18 @@ pub fn generate_bt1886_profile(white_lum: f64, black_lum: f64) {
     )
     .unwrap();
 
+    let filename = eotf.filename_slug();
     profile
-        .save_profile_to_file(Path::new("Yutani_PA32UCDM_BT1886.icc"))
+        .save_profile_to_file(Path::new(&filename))
         .unwrap();
-    println!("Saved Yutani_PA32UCDM_BT1886.icc");
+    println!("Saved {filename}");
 }
 
-/// Generate a calibrated BT.1886 ICC profile from real Spyder sensor measurements,
-/// saving both to `./Yutani_PA32UCDM_BT1886.icc` and `~/.local/share/icc/Yutani_PA32UCDM_BT1886.icc`.
+/// Generate a calibrated ICC profile from real Spyder sensor measurements and chosen EOTF,
+/// saving both to the current working directory and `~/.local/share/icc/`.
 pub fn generate_profile_from_measurements(
     meas: &CalibrationMeasurements,
+    eotf: EotfConfig,
 ) -> Result<Vec<PathBuf>> {
     // If white luminance is near-zero (e.g. cap was left on during a dry run),
     // fall back to sensible 100-nit / D65 / BT.709 defaults so profile creation still succeeds.
@@ -138,25 +214,26 @@ pub fn generate_profile_from_measurements(
         }
     };
 
-    let curve_data = build_bt1886_lut(white_lum, black_lum);
-    let bt1886_curve = ToneCurve::new_tabulated(&curve_data);
-    let curves = [&bt1886_curve, &bt1886_curve, &bt1886_curve];
+    let curve_data = build_eotf_lut(white_lum, black_lum, eotf);
+    let trc_curve = ToneCurve::new_tabulated(&curve_data);
+    let curves = [&trc_curve, &trc_curve, &trc_curve];
 
     let mut profile = Profile::new_rgb(&white_xyy, &primaries, &curves)
         .context("failed to construct lcms2 RGB profile")?;
 
     let mut saved_paths = Vec::new();
+    let filename = eotf.filename_slug();
 
-    let local_path = PathBuf::from("Yutani_PA32UCDM_BT1886.icc");
+    let local_path = PathBuf::from(&filename);
     profile
         .save_profile_to_file(&local_path)
-        .context("failed to write Yutani_PA32UCDM_BT1886.icc")?;
+        .with_context(|| format!("failed to write {filename}"))?;
     saved_paths.push(local_path);
 
     if let Ok(home) = std::env::var("HOME") {
         let icc_dir = PathBuf::from(home).join(".local/share/icc");
         if std::fs::create_dir_all(&icc_dir).is_ok() {
-            let user_icc = icc_dir.join("Yutani_PA32UCDM_BT1886.icc");
+            let user_icc = icc_dir.join(&filename);
             if profile.save_profile_to_file(&user_icc).is_ok() {
                 saved_paths.push(user_icc);
             }

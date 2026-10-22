@@ -17,9 +17,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Detect { #[arg(long)] all: bool },
+    Detect {
+        #[arg(long)]
+        all: bool,
+    },
     Probe,
-    Calibrate,
+    Calibrate {
+        /// Target gamma exponent (e.g. 2.4, 2.2, 2.6)
+        #[arg(short, long, default_value_t = 2.4)]
+        gamma: f64,
+        /// Use pure power-law gamma instead of BT.1886 black-level compensation
+        #[arg(long)]
+        pure_power: bool,
+        /// Use IEC 61966-2-1 sRGB piecewise curve
+        #[arg(long)]
+        srgb: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -36,8 +49,22 @@ fn main() -> Result<()> {
         match cmd {
             Command::Detect { all } => driver::detect(all)?,
             Command::Probe => driver::spyder::probe()?,
-            Command::Calibrate => {
-                println!("Starting CLI spot measurement & BT.1886 profile generation...");
+            Command::Calibrate {
+                gamma,
+                pure_power,
+                srgb,
+            } => {
+                let eotf = if srgb {
+                    icc::EotfConfig::Srgb
+                } else if pure_power {
+                    icc::EotfConfig::PurePower { gamma }
+                } else {
+                    icc::EotfConfig::Bt1886 { gamma }
+                };
+                println!(
+                    "Starting CLI spot measurement & profile generation ({})...",
+                    eotf.display_label()
+                );
                 match driver::spyder::SpyderSession::open() {
                     Ok(session) => {
                         let reading = session.measure()?;
@@ -47,11 +74,11 @@ fn main() -> Result<()> {
                             lum, x, y
                         );
                         let white_lum = if lum > 5.0 { lum } else { 100.0 };
-                        icc::generate_bt1886_profile(white_lum, 0.05);
+                        icc::generate_bt1886_profile_with_eotf(white_lum, 0.05, eotf);
                     }
                     Err(e) => {
-                        println!("Sensor unavailable ({e:#}); generating baseline 100-nit BT.1886 profile...");
-                        icc::generate_bt1886_profile(100.0, 0.05);
+                        println!("Sensor unavailable ({e:#}); generating baseline 100-nit profile...");
+                        icc::generate_bt1886_profile_with_eotf(100.0, 0.05, eotf);
                     }
                 }
             }
