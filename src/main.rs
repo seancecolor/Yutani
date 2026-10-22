@@ -7,7 +7,6 @@ mod gui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lcms2::{Profile, ToneCurve};
 
 #[derive(Parser)]
 #[command(name = "yutani", version, about)]
@@ -38,14 +37,27 @@ fn main() -> Result<()> {
             Command::Detect { all } => driver::detect(all)?,
             Command::Probe => driver::spyder::probe()?,
             Command::Calibrate => {
-                println!("Starting calibration...");
-                // Note: Implement Wayland full-screen patch display and measurement sequence
-                // For demonstration, we just generate the BT.1886 curve directly.
-                icc::generate_bt1886_profile(100.0, 0.05); // Example values: 100 nits white, 0.05 nits black
+                println!("Starting CLI spot measurement & BT.1886 profile generation...");
+                match driver::spyder::SpyderSession::open() {
+                    Ok(session) => {
+                        let reading = session.measure()?;
+                        let (x, y, lum) = reading.to_xyy();
+                        println!(
+                            "Measured current screen: {:.3} cd/m² (CIE xy = {:.4}, {:.4})",
+                            lum, x, y
+                        );
+                        let white_lum = if lum > 5.0 { lum } else { 100.0 };
+                        icc::generate_bt1886_profile(white_lum, 0.05);
+                    }
+                    Err(e) => {
+                        println!("Sensor unavailable ({e:#}); generating baseline 100-nit BT.1886 profile...");
+                        icc::generate_bt1886_profile(100.0, 0.05);
+                    }
+                }
             }
         }
     } else {
-        gui::run_gui()?;
+        gui::run_gui().map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
     }
 
     Ok(())
