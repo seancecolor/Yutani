@@ -1,0 +1,22 @@
+[package]
+name = "yutani"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A Wayland-native display profiler for Spyder colorimeters"
+
+[[bin]]
+name = "yutani"
+path = "src/main.rs"
+
+[dependencies]
+hidapi = "2"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+rusb = "0.9.4"
+lcms2 = "6.0"
+zbus = "4.0"
+eframe = { version = "0.27", default-features = false, features = ["wayland", "wgpu"] }
