@@ -6,11 +6,11 @@ use eframe::egui;
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
     bt1886_params, eotf_target_luminance, generate_profile_from_measurements,
-    CalibrationMeasurements, DisplayTarget, EotfConfig, VcgtSummary,
+    CalibrationMeasurements, ColorGamut, DisplayTarget, EotfConfig, VcgtSummary,
 };
 
-/// Duration of the MU-TH-UR 6000 / Weyland-Yutani startup CRT animation.
-const BOOT_SEQUENCE_DURATION: Duration = Duration::from_millis(3400);
+/// Duration of the Yutani CRT terminal startup sequence.
+const BOOT_SEQUENCE_DURATION: Duration = Duration::from_millis(3000);
 
 /// Time to let the display panel settle on a new color patch before triggering the sensor read.
 const PATCH_SETTLE_DURATION: Duration = Duration::from_millis(450);
@@ -208,7 +208,7 @@ fn compute_d65_alignment_metrics(reading: &XyzReading) -> ([f64; 3], f64, f64) {
     (rgb_pct, cct, delta_e)
 }
 
-/// Draw a retro MU-TH-UR 6000 horizontal center-zero deviation gauge bar.
+/// Draw a horizontal center-zero deviation gauge bar.
 fn draw_deviation_bar(
     ui: &mut egui::Ui,
     label: &str,
@@ -259,7 +259,7 @@ fn draw_deviation_bar(
     });
 }
 
-/// Draw the MU-TH-UR 6000 EOTF Tracking Curve (Target vs. Measured) + Grayscale ΔE sub-chart.
+/// Draw the Yutani EOTF Tracking Curve (Target vs. Measured).
 fn draw_eotf_graph(
     ui: &mut egui::Ui,
     measurements: &CalibrationMeasurements,
@@ -272,8 +272,8 @@ fn draw_eotf_graph(
     let bg_dark = egui::Color32::from_rgb(10, 9, 6);
 
     ui.vertical(|ui| {
-        ui.monospace("EOTF LUMINANCE RESPONSE // TARGET (AMBER) vs RAW PANEL (GREEN)");
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(420.0, 230.0), egui::Sense::hover());
+        ui.monospace("EOTF LUMINANCE // TARGET (AMBER) vs MEASURED (CYAN)");
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(430.0, 235.0), egui::Sense::hover());
         let painter = ui.painter();
 
         painter.rect_filled(rect, 0.0, bg_dark);
@@ -378,14 +378,21 @@ fn draw_eotf_graph(
     });
 }
 
-/// Draw the CIE 1931 xy Chromaticity Diagram with Spectral Locus, Rec.709 reference triangle,
-/// measured Asus PA32UCDM gamut triangle, and D65 / measured whitepoint markers.
-fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurements) {
+/// Draw the CIE 1931 xy Chromaticity Diagram with Spectral Locus, Target Gamut (Rec.709 / P3-D65),
+/// secondary reference gamut, measured panel triangle, and all measured patch coordinates
+/// (R, G, B primaries, Peak White, and all grayscale steps).
+fn draw_cie_gamut_graph(
+    ui: &mut egui::Ui,
+    measurements: &CalibrationMeasurements,
+    gamut: ColorGamut,
+) {
     let amber = egui::Color32::from_rgb(255, 180, 40);
     let dim_amber = egui::Color32::from_rgb(80, 55, 14);
+    let faint_ref = egui::Color32::from_rgb(65, 45, 14);
     let grid_amber = egui::Color32::from_rgb(35, 24, 8);
     let locus_amber = egui::Color32::from_rgb(120, 82, 22);
     let meas_cyan = egui::Color32::from_rgb(90, 235, 190);
+    let gray_dot = egui::Color32::from_rgb(255, 230, 140);
     let bg_dark = egui::Color32::from_rgb(10, 9, 6);
 
     // Approximate CIE 1931 2-degree spectral locus (380nm..700nm) in (x, y)
@@ -416,8 +423,11 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
     ];
 
     ui.vertical(|ui| {
-        ui.monospace("CIE 1931 xy GAMUT // REC.709 (AMBER) vs MEASURED (GREEN)");
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(420.0, 230.0), egui::Sense::hover());
+        ui.monospace(format!(
+            "CIE 1931 xy GAMUT // {} TARGET vs MEASURED PATCH LOCATIONS",
+            gamut.short_code().to_ascii_uppercase()
+        ));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(430.0, 235.0), egui::Sense::hover());
         let painter = ui.painter();
 
         painter.rect_filled(rect, 0.0, bg_dark);
@@ -466,34 +476,51 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
             painter.line_segment([last, first], egui::Stroke::new(1.0_f32, locus_amber));
         }
 
-        // 2. Reference BT.709 triangle: R(0.64, 0.33), G(0.30, 0.60), B(0.15, 0.06)
-        let r709 = to_screen(0.64, 0.33);
-        let g709 = to_screen(0.30, 0.60);
-        let b709 = to_screen(0.15, 0.06);
-        painter.line_segment([r709, g709], egui::Stroke::new(1.5_f32, amber));
-        painter.line_segment([g709, b709], egui::Stroke::new(1.5_f32, amber));
-        painter.line_segment([b709, r709], egui::Stroke::new(1.5_f32, amber));
+        // 2. Draw secondary comparison triangle (faint) + active Target Gamut triangle (bright amber)
+        let secondary_xy = match gamut {
+            ColorGamut::Rec709 => ColorGamut::DisplayP3.reference_primaries_xy(),
+            ColorGamut::DisplayP3 | ColorGamut::Native => ColorGamut::Rec709.reference_primaries_xy(),
+        };
+        let sec_r = to_screen(secondary_xy[0].0, secondary_xy[0].1);
+        let sec_g = to_screen(secondary_xy[1].0, secondary_xy[1].1);
+        let sec_b = to_screen(secondary_xy[2].0, secondary_xy[2].1);
+        painter.line_segment([sec_r, sec_g], egui::Stroke::new(1.0_f32, faint_ref));
+        painter.line_segment([sec_g, sec_b], egui::Stroke::new(1.0_f32, faint_ref));
+        painter.line_segment([sec_b, sec_r], egui::Stroke::new(1.0_f32, faint_ref));
 
-        // 3. Measured primaries triangle (if valid optical reading)
+        let target_xy = gamut.reference_primaries_xy();
+        let tgt_r = to_screen(target_xy[0].0, target_xy[0].1);
+        let tgt_g = to_screen(target_xy[1].0, target_xy[1].1);
+        let tgt_b = to_screen(target_xy[2].0, target_xy[2].1);
+        painter.line_segment([tgt_r, tgt_g], egui::Stroke::new(1.5_f32, amber));
+        painter.line_segment([tgt_g, tgt_b], egui::Stroke::new(1.5_f32, amber));
+        painter.line_segment([tgt_b, tgt_r], egui::Stroke::new(1.5_f32, amber));
+
+        // Hollow rings on target primary vertices
+        for &pt in &[tgt_r, tgt_g, tgt_b] {
+            painter.circle_stroke(pt, 3.5, egui::Stroke::new(1.2_f32, amber));
+        }
+
+        // 3. Measured primaries triangle & primary reading markers
         let valid_prim =
             (measurements.red.y + measurements.green.y + measurements.blue.y) > 0.5;
         let (rx, ry) = if valid_prim {
             let (x, y, _) = measurements.red.to_xyy();
             (x, y)
         } else {
-            (0.64, 0.33)
+            target_xy[0]
         };
         let (gx, gy) = if valid_prim {
             let (x, y, _) = measurements.green.to_xyy();
             (x, y)
         } else {
-            (0.30, 0.60)
+            target_xy[1]
         };
         let (bx, by) = if valid_prim {
             let (x, y, _) = measurements.blue.to_xyy();
             (x, y)
         } else {
-            (0.15, 0.06)
+            target_xy[2]
         };
 
         let r_pt = to_screen(rx, ry);
@@ -503,34 +530,96 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
         painter.line_segment([g_pt, b_pt], egui::Stroke::new(1.5_f32, meas_cyan));
         painter.line_segment([b_pt, r_pt], egui::Stroke::new(1.5_f32, meas_cyan));
 
-        painter.circle_filled(r_pt, 3.5, egui::Color32::from_rgb(245, 70, 60));
-        painter.circle_filled(g_pt, 3.5, egui::Color32::from_rgb(70, 235, 90));
-        painter.circle_filled(b_pt, 3.5, egui::Color32::from_rgb(80, 150, 255));
+        // Error vectors from target primary vertices to measured primary points
+        painter.line_segment([tgt_r, r_pt], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(245, 70, 60)));
+        painter.line_segment([tgt_g, g_pt], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 235, 90)));
+        painter.line_segment([tgt_b, b_pt], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 150, 255)));
 
-        // 4. D65 Target crosshair & measured whitepoint
+        painter.circle_filled(r_pt, 4.0, egui::Color32::from_rgb(245, 70, 60));
+        painter.circle_filled(g_pt, 4.0, egui::Color32::from_rgb(70, 235, 90));
+        painter.circle_filled(b_pt, 4.0, egui::Color32::from_rgb(80, 150, 255));
+
+        painter.text(
+            egui::pos2(r_pt.x + 6.0, r_pt.y),
+            egui::Align2::LEFT_CENTER,
+            "R",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(255, 110, 100),
+        );
+        painter.text(
+            egui::pos2(g_pt.x + 6.0, g_pt.y - 4.0),
+            egui::Align2::LEFT_CENTER,
+            "G",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(100, 245, 120),
+        );
+        painter.text(
+            egui::pos2(b_pt.x + 6.0, b_pt.y),
+            egui::Align2::LEFT_CENTER,
+            "B",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(115, 175, 255),
+        );
+
+        // 4. D65 Target crosshair
         let d65_pt = to_screen(0.3127, 0.3290);
         painter.line_segment(
             [
-                egui::pos2(d65_pt.x - 5.0, d65_pt.y),
-                egui::pos2(d65_pt.x + 5.0, d65_pt.y),
+                egui::pos2(d65_pt.x - 5.5, d65_pt.y),
+                egui::pos2(d65_pt.x + 5.5, d65_pt.y),
             ],
             egui::Stroke::new(1.5_f32, amber),
         );
         painter.line_segment(
             [
-                egui::pos2(d65_pt.x, d65_pt.y - 5.0),
-                egui::pos2(d65_pt.x, d65_pt.y + 5.0),
+                egui::pos2(d65_pt.x, d65_pt.y - 5.5),
+                egui::pos2(d65_pt.x, d65_pt.y + 5.5),
             ],
             egui::Stroke::new(1.5_f32, amber),
         );
 
+        // 5. Plot every measured grayscale patch location inside the gamut diagram
+        let mut gray_screen_pts = Vec::new();
+        for &(v, ref reading) in &measurements.grayscale {
+            let (gx_i, gy_i, glum) = reading.to_xyy();
+            // Skip near-zero dark patch if luminance is too low for stable chromaticity
+            if glum > 0.05 && gx_i > 0.01 && gy_i > 0.01 {
+                let pt = to_screen(gx_i, gy_i);
+                gray_screen_pts.push((v, pt));
+            }
+        }
+        for win in gray_screen_pts.windows(2) {
+            painter.line_segment(
+                [win[0].1, win[1].1],
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 225, 130, 140)),
+            );
+        }
+        for &(_v, pt) in &gray_screen_pts {
+            painter.circle_filled(pt, 2.2, gray_dot);
+        }
+
+        // Peak White (100%) outer ring marker
         let (wx, wy, wlum) = measurements.white.to_xyy();
         if wlum > 0.5 {
             let w_pt = to_screen(wx, wy);
-            painter.circle_stroke(w_pt, 4.0, egui::Stroke::new(1.5_f32, meas_cyan));
+            painter.circle_stroke(w_pt, 4.5, egui::Stroke::new(1.5_f32, meas_cyan));
+            painter.text(
+                egui::pos2(w_pt.x + 6.0, w_pt.y - 6.0),
+                egui::Align2::LEFT_CENTER,
+                "W",
+                egui::FontId::monospace(9.5),
+                meas_cyan,
+            );
         }
 
-        // Axis labels
+        // Legend & Axis labels
+        painter.text(
+            egui::pos2(plot.left() + 6.0, plot.top() + 8.0),
+            egui::Align2::LEFT_CENTER,
+            "o:Target  *:Meas RGB  ·:Gray 10-90%  O:White  +:D65",
+            egui::FontId::monospace(9.5),
+            amber,
+        );
         painter.text(
             egui::pos2(plot.left(), rect.bottom() - 10.0),
             egui::Align2::LEFT_CENTER,
@@ -541,7 +630,7 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
         painter.text(
             egui::pos2(plot.center().x, rect.bottom() - 10.0),
             egui::Align2::CENTER_CENTER,
-            "CIE x (D65 +)",
+            "CIE 1931 x",
             egui::FontId::monospace(10.0),
             amber,
         );
@@ -569,7 +658,221 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
     });
 }
 
-/// Render the animated Weyland-Yutani / MU-TH-UR 6000 vector wireframe boot sequence.
+/// Draw the 1D LUT (`vcgt`) Calibration Correction graphs:
+/// 1) Left chart: Absolute VCGT Transfer Curves (`Output Drive` vs `Input Signal`) for R, G, B.
+/// 2) Right chart: Per-Channel Drive Delta (`Δ% = (VCGT_out - Signal_in) * 100%`) showing the exact
+///    white-balance and EOTF correction applied across 0%..100%.
+fn draw_vcgt_correction_graph(ui: &mut egui::Ui, vcgt_summary: &VcgtSummary) {
+    let amber = egui::Color32::from_rgb(255, 180, 40);
+    let dim_amber = egui::Color32::from_rgb(75, 50, 14);
+    let grid_amber = egui::Color32::from_rgb(35, 24, 8);
+    let bg_dark = egui::Color32::from_rgb(10, 9, 6);
+    let ch_colors = [
+        egui::Color32::from_rgb(245, 75, 65),  // Red LUT
+        egui::Color32::from_rgb(75, 230, 95),  // Green LUT
+        egui::Color32::from_rgb(85, 155, 255), // Blue LUT
+    ];
+
+    ui.horizontal_wrapped(|ui| {
+        // Chart A: Absolute 1D LUT Curves (R, G, B output vs linear diagonal)
+        ui.vertical(|ui| {
+            ui.monospace("1D VCGT LUT TRANSFER CURVES // R, G, B OUTPUT vs UNCORRECTED");
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(430.0, 210.0), egui::Sense::hover());
+            let painter = ui.painter();
+
+            painter.rect_filled(rect, 0.0, bg_dark);
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, dim_amber));
+
+            let pad = 28.0;
+            let plot = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + pad, rect.top() + 12.0),
+                egui::pos2(rect.right() - 12.0, rect.bottom() - 24.0),
+            );
+
+            for i in 0..=10 {
+                let t = i as f32 / 10.0;
+                let x = plot.left() + t * plot.width();
+                let y = plot.bottom() - t * plot.height();
+                painter.line_segment(
+                    [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+                    egui::Stroke::new(1.0_f32, grid_amber),
+                );
+                painter.line_segment(
+                    [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                    egui::Stroke::new(1.0_f32, grid_amber),
+                );
+            }
+            painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0_f32, dim_amber));
+
+            // Identity diagonal (uncorrected 1:1 ramp)
+            painter.line_segment(
+                [
+                    egui::pos2(plot.left(), plot.bottom()),
+                    egui::pos2(plot.right(), plot.top()),
+                ],
+                egui::Stroke::new(1.0_f32, dim_amber),
+            );
+
+            // R, G, B VCGT curves sampled at 65 points
+            for c in 0..3 {
+                let mut pts = Vec::with_capacity(65);
+                for i in 0..=64 {
+                    let v = i as f64 / 64.0;
+                    let rgb = vcgt_summary.sample_rgb(v);
+                    let px = plot.left() + (v as f32) * plot.width();
+                    let py = plot.bottom() - (rgb[c].clamp(0.0, 1.0) as f32) * plot.height();
+                    pts.push(egui::pos2(px, py));
+                }
+                for win in pts.windows(2) {
+                    painter.line_segment([win[0], win[1]], egui::Stroke::new(1.6_f32, ch_colors[c]));
+                }
+            }
+
+            painter.text(
+                egui::pos2(plot.left(), rect.bottom() - 10.0),
+                egui::Align2::LEFT_CENTER,
+                "0% IN",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+            painter.text(
+                egui::pos2(plot.center().x, rect.bottom() - 10.0),
+                egui::Align2::CENTER_CENTER,
+                "LUT OUTPUT (R/G/B)",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+            painter.text(
+                egui::pos2(plot.right(), rect.bottom() - 10.0),
+                egui::Align2::RIGHT_CENTER,
+                "100%",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+        });
+
+        ui.add_space(12.0);
+
+        // Chart B: VCGT Correction Delta (%) = (VCGT_c(v) - v) * 100%
+        ui.vertical(|ui| {
+            ui.monospace("APPLIED VCGT CORRECTION DELTA // ΔDRIVE (%) PER CHANNEL");
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(430.0, 210.0), egui::Sense::hover());
+            let painter = ui.painter();
+
+            painter.rect_filled(rect, 0.0, bg_dark);
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, dim_amber));
+
+            let pad = 34.0;
+            let plot = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + pad, rect.top() + 12.0),
+                egui::pos2(rect.right() - 12.0, rect.bottom() - 24.0),
+            );
+
+            // Determine max percentage deviation so small or large corrections remain clearly visible
+            let mut max_abs_pct = 5.0_f64;
+            for i in 0..=64 {
+                let v = i as f64 / 64.0;
+                let rgb = vcgt_summary.sample_rgb(v);
+                for c in 0..3 {
+                    let diff_pct = ((rgb[c] - v) * 100.0).abs();
+                    if diff_pct > max_abs_pct {
+                        max_abs_pct = diff_pct;
+                    }
+                }
+            }
+            let span_pct = (max_abs_pct * 1.15).clamp(5.0, 35.0);
+
+            for i in 0..=10 {
+                let t = i as f32 / 10.0;
+                let x = plot.left() + t * plot.width();
+                let y = plot.bottom() - t * plot.height();
+                painter.line_segment(
+                    [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+                    egui::Stroke::new(1.0_f32, grid_amber),
+                );
+                painter.line_segment(
+                    [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                    egui::Stroke::new(1.0_f32, grid_amber),
+                );
+            }
+            painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0_f32, dim_amber));
+
+            // Center 0.0% baseline
+            let zero_y = plot.center().y;
+            painter.line_segment(
+                [
+                    egui::pos2(plot.left(), zero_y),
+                    egui::pos2(plot.right(), zero_y),
+                ],
+                egui::Stroke::new(1.5_f32, amber),
+            );
+
+            // Plot R, G, B delta curves
+            for c in 0..3 {
+                let mut pts = Vec::with_capacity(65);
+                for i in 0..=64 {
+                    let v = i as f64 / 64.0;
+                    let rgb = vcgt_summary.sample_rgb(v);
+                    let diff_pct = (rgb[c] - v) * 100.0;
+                    let norm_y = (diff_pct / span_pct).clamp(-1.0, 1.0) as f32;
+                    let px = plot.left() + (v as f32) * plot.width();
+                    let py = zero_y - norm_y * (plot.height() * 0.5);
+                    pts.push(egui::pos2(px, py));
+                }
+                for win in pts.windows(2) {
+                    painter.line_segment([win[0], win[1]], egui::Stroke::new(1.8_f32, ch_colors[c]));
+                }
+            }
+
+            painter.text(
+                egui::pos2(rect.left() + 3.0, plot.top() + 6.0),
+                egui::Align2::LEFT_CENTER,
+                format!("+{:.0}%", span_pct),
+                egui::FontId::monospace(9.5),
+                amber,
+            );
+            painter.text(
+                egui::pos2(rect.left() + 3.0, zero_y),
+                egui::Align2::LEFT_CENTER,
+                " 0%",
+                egui::FontId::monospace(9.5),
+                amber,
+            );
+            painter.text(
+                egui::pos2(rect.left() + 3.0, plot.bottom() - 6.0),
+                egui::Align2::LEFT_CENTER,
+                format!("-{:.0}%", span_pct),
+                egui::FontId::monospace(9.5),
+                amber,
+            );
+            painter.text(
+                egui::pos2(plot.left(), rect.bottom() - 10.0),
+                egui::Align2::LEFT_CENTER,
+                "0% IN",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+            painter.text(
+                egui::pos2(plot.center().x, rect.bottom() - 10.0),
+                egui::Align2::CENTER_CENTER,
+                "CORRECTION OFFSET (R/G/B)",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+            painter.text(
+                egui::pos2(plot.right(), rect.bottom() - 10.0),
+                egui::Align2::RIGHT_CENTER,
+                "100%",
+                egui::FontId::monospace(10.0),
+                amber,
+            );
+        });
+    });
+}
+
+/// Render the animated Yutani CRT terminal startup sequence (without emblem/logo).
 fn draw_boot_sequence(
     ui: &mut egui::Ui,
     progress: f32,
@@ -635,85 +938,46 @@ fn draw_boot_sequence(
         painter.line_segment([origin, origin + dy], egui::Stroke::new(2.0_f32, amber));
     }
 
-    // Animated Vector Wireframe Emblem (Interlocking Winged W-Y Geometric Crest)
-    let logo_center = egui::pos2(center.x, rect.top() + 165.0);
-    let logo_alpha = (progress / 0.45).clamp(0.0, 1.0);
-    let wing_span = 180.0 * logo_alpha;
-    let wing_h = 68.0 * logo_alpha;
-
-    // Outer hexagonal/winged frame
-    let hex_pts = [
-        egui::pos2(logo_center.x - wing_span, logo_center.y - wing_h * 0.6),
-        egui::pos2(logo_center.x - wing_span * 0.45, logo_center.y - wing_h),
-        egui::pos2(logo_center.x + wing_span * 0.45, logo_center.y - wing_h),
-        egui::pos2(logo_center.x + wing_span, logo_center.y - wing_h * 0.6),
-        egui::pos2(logo_center.x + wing_span * 0.55, logo_center.y + wing_h),
-        egui::pos2(logo_center.x - wing_span * 0.55, logo_center.y + wing_h),
-    ];
-    for i in 0..hex_pts.len() {
-        let p0 = hex_pts[i];
-        let p1 = hex_pts[(i + 1) % hex_pts.len()];
-        painter.line_segment([p0, p1], egui::Stroke::new(1.5_f32, dim_amber));
-    }
-
-    // Vector "W / Y" interlocking chevron strokes
-    let w_scale = (progress / 0.55).clamp(0.0, 1.0);
-    if w_scale > 0.05 {
-        let w_pts = [
-            egui::pos2(logo_center.x - 115.0 * w_scale, logo_center.y - 36.0 * w_scale),
-            egui::pos2(logo_center.x - 62.0 * w_scale, logo_center.y + 38.0 * w_scale),
-            egui::pos2(logo_center.x, logo_center.y - 18.0 * w_scale),
-            egui::pos2(logo_center.x + 62.0 * w_scale, logo_center.y + 38.0 * w_scale),
-            egui::pos2(logo_center.x + 115.0 * w_scale, logo_center.y - 36.0 * w_scale),
-        ];
-        for win in w_pts.windows(2) {
-            painter.line_segment([win[0], win[1]], egui::Stroke::new(3.0_f32, bright_amber));
-        }
-        // Central Y-stem + optical target ring
-        painter.line_segment(
-            [
-                egui::pos2(logo_center.x, logo_center.y - 18.0 * w_scale),
-                egui::pos2(logo_center.x, logo_center.y + 52.0 * w_scale),
-            ],
-            egui::Stroke::new(2.5_f32, amber),
-        );
-        painter.circle_stroke(
-            logo_center,
-            42.0 * w_scale,
-            egui::Stroke::new(1.2_f32, amber),
-        );
-    }
-
+    // Clean Yutani terminal header banner
+    let header_y = rect.top() + 120.0;
     painter.text(
-        egui::pos2(center.x, logo_center.y + 92.0),
+        egui::pos2(center.x, header_y),
         egui::Align2::CENTER_CENTER,
-        "Y U T A N I   C O R P O R A T I O N",
-        egui::FontId::monospace(20.0),
+        "Y U T A N I   W A Y L A N D",
+        egui::FontId::monospace(24.0),
         bright_amber,
     );
     painter.text(
-        egui::pos2(center.x, logo_center.y + 116.0),
+        egui::pos2(center.x, header_y + 28.0),
         egui::Align2::CENTER_CENTER,
-        "MU-TH-UR 6000 // WAYLAND OPTICAL COLORIMETRY SUBSYSTEM",
+        "OPTICAL COLORIMETRY & 1D LUT CALIBRATION SUBSYSTEM",
         egui::FontId::monospace(13.0),
         amber,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 310.0, header_y + 48.0),
+            egui::pos2(center.x + 310.0, header_y + 48.0),
+        ],
+        egui::Stroke::new(1.0_f32, dim_amber),
     );
 
     // Teletype boot diagnostic lines revealed sequentially with progress
     let boot_lines = [
-        (0.08_f32, "> INITIALISING MU-TH-UR 6000 MAINFRAME [ROM 2.104]... OK"),
-        (0.22_f32, "> ENGAGING KDE PLASMA WAYLAND COLOR MANAGEMENT BRIDGE... OK"),
-        (0.38_f32, "> LOADING TARGET MATRICES: ASUS PA32UCDM // PA279CRV // MQ16AHE... OK"),
-        (0.54_f32, "> CALIBRATING ITU-R BT.1886 & 3x1024 VCGT LUT SOLVER... OK"),
-        (0.70_f32, "> PROBING USB BUS (VID 0x085C) FOR DATACOLOR INSTRUMENTS..."),
+        (0.06_f32, "> INITIALISING YUTANI COLORIMETRY ENGINE [REV 2026.10]... OK"),
+        (0.20_f32, "> ENGAGING KDE PLASMA WAYLAND COLOR MANAGEMENT BRIDGE... OK"),
+        (0.35_f32, "> LOADING DISPLAY PROFILES: ASUS PA32UCDM // PA279CRV // MQ16AHE... OK"),
+        (0.50_f32, "> LOADING GAMUT SPACES: REC.709 // DISPLAY P3 (D65) // NATIVE... OK"),
+        (0.65_f32, "> CALIBRATING ITU-R BT.1886 & 3x1024 VCGT LUT SOLVER... OK"),
+        (0.78_f32, "> PROBING USB BUS (VID 0x085C) FOR DATACOLOR INSTRUMENTS..."),
     ];
 
     let log_left = center.x - 310.0;
-    let mut log_y = logo_center.y + 158.0;
+    let mut log_y = header_y + 82.0;
 
     for &(threshold, text) in &boot_lines {
         if progress >= threshold {
-            let local_t = ((progress - threshold) / 0.14).clamp(0.0, 1.0);
+            let local_t = ((progress - threshold) / 0.13).clamp(0.0, 1.0);
             let char_count = ((text.len() as f32) * local_t).ceil() as usize;
             let slice: String = text.chars().take(char_count).collect();
             painter.text(
@@ -723,11 +987,11 @@ fn draw_boot_sequence(
                 egui::FontId::monospace(12.5),
                 amber,
             );
-            log_y += 22.0;
+            log_y += 24.0;
         }
     }
 
-    if progress >= 0.82 {
+    if progress >= 0.86 {
         let blink = ((progress * 18.0) as i32) % 2 == 0;
         let cursor = if blink { " █" } else { "" };
         painter.text(
@@ -776,9 +1040,9 @@ fn draw_boot_sequence(
 }
 
 enum AppPhase {
-    /// Animated Weyland-Yutani / MU-TH-UR 6000 startup sequence.
+    /// Animated Yutani CRT terminal startup sequence.
     BootSequence { started_at: Instant },
-    /// Main MU-TH-UR 6000 control console.
+    /// Main Yutani control console.
     Dashboard,
     /// Fullscreen target reticle for physical sensor placement on the monitor.
     PlacementReticle,
@@ -810,6 +1074,7 @@ struct YutaniApp {
     status_log: String,
     last_single_read: Option<XyzReading>,
     display_target: DisplayTarget,
+    color_gamut: ColorGamut,
     eotf: EotfConfig,
     target_nits: f64,
     phase: AppPhase,
@@ -824,6 +1089,7 @@ impl YutaniApp {
             status_log: String::from("SYSTEM READY. INITIALISING INSTRUMENT LINK..."),
             last_single_read: None,
             display_target: default_display,
+            color_gamut: ColorGamut::default(),
             eotf: EotfConfig::default(),
             target_nits: default_display.default_target_nits(),
             phase: AppPhase::BootSequence {
@@ -899,7 +1165,12 @@ impl YutaniApp {
             grayscale,
         };
 
-        match generate_profile_from_measurements(&measurements, self.display_target, self.eotf) {
+        match generate_profile_from_measurements(
+            &measurements,
+            self.display_target,
+            self.color_gamut,
+            self.eotf,
+        ) {
             Ok((saved_paths, vcgt_summary)) => {
                 self.status_log = format!(
                     "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S) WITH 3x1024 VCGT",
@@ -936,6 +1207,7 @@ impl eframe::App for YutaniApp {
 
         let current_eotf = self.eotf;
         let current_display = self.display_target;
+        let current_gamut = self.color_gamut;
 
         match &mut self.phase {
             AppPhase::BootSequence { started_at } => {
@@ -976,7 +1248,7 @@ impl eframe::App for YutaniApp {
                     ui.label("YUTANI DISPLAY PROFILER // BUILDING BETTER COLORS");
                     ui.separator();
 
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.label("SELECT DISPLAY TARGET:");
                     ui.horizontal_wrapped(|ui| {
                         for target in DisplayTarget::ALL {
@@ -988,22 +1260,34 @@ impl eframe::App for YutaniApp {
                         }
                     });
 
+                    ui.add_space(4.0);
+                    ui.label("SELECT TARGET COLOR GAMUT SPACE:");
+                    ui.horizontal_wrapped(|ui| {
+                        for gamut in ColorGamut::ALL {
+                            let is_sel = self.color_gamut == gamut;
+                            if ui.selectable_label(is_sel, gamut.button_label()).clicked() {
+                                self.color_gamut = gamut;
+                            }
+                        }
+                    });
+
                     ui.add_space(6.0);
                     ui.label(format!(
                         "DISPLAY TARGET : {} — {}",
                         self.display_target.full_name(),
                         self.display_target.panel_spec()
                     ));
+                    ui.label(format!("COLOR GAMUT    : {}", self.color_gamut.display_label()));
                     ui.label(format!("TARGET EOTF    : {}", self.eotf.display_label()));
                     ui.label(format!(
                         "OUTPUT PROFILE : {}",
-                        self.eotf.filename_for(self.display_target)
+                        self.eotf.filename_for(self.display_target, self.color_gamut)
                     ));
                     ui.label("TARGET WHITE   : CIE D65 (x = 0.3127, y = 0.3290)");
                     ui.label(format!("SENSOR STATUS  : {}", self.status_log));
 
                     if let Some(s) = &self.session {
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                         ui.label(format!(
                             "MATRIX ROW Y   : [{:+.6}, {:+.6}, {:+.6}] (setup_off = {:?})",
                             s.matrix[1][0], s.matrix[1][1], s.matrix[1][2], s.setup_off
@@ -1019,7 +1303,7 @@ impl eframe::App for YutaniApp {
                         ui.label(format!("DARK OFFSET    : {bcal_str}"));
                     }
 
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.label("SELECT TARGET GAMMA / EOTF CURVE:");
                     ui.horizontal_wrapped(|ui| {
@@ -1083,7 +1367,7 @@ impl eframe::App for YutaniApp {
                         });
                     }
 
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("TARGET PEAK LUMINANCE (OSD):");
                         for &preset in &[80.0, 100.0, 120.0, 160.0, 200.0] {
@@ -1103,7 +1387,7 @@ impl eframe::App for YutaniApp {
                         );
                     });
 
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
                         if ui.button(" [ RE-SCAN USB INSTRUMENT ] ").clicked() {
@@ -1142,7 +1426,7 @@ impl eframe::App for YutaniApp {
                                             self.status_log = format!("READ FAILED: {e:#}");
                                         }
                                     }
-                                 }
+                                }
                             }
 
                             if ui.button(" [ LIVE OSD WHITE & NITS METER ] ").clicked() {
@@ -1164,7 +1448,7 @@ impl eframe::App for YutaniApp {
 
                     if let Some(r) = self.last_single_read {
                         let (cx, cy, lum) = r.to_xyy();
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
                         ui.separator();
                         ui.label("TELEMETRY // LAST SPOT MEASUREMENT:");
                         ui.label(format!(
@@ -1207,7 +1491,7 @@ impl eframe::App for YutaniApp {
                         let painter = ui.painter();
                         let amber = egui::Color32::from_rgb(255, 180, 40);
 
-                        // Draw target reticle in exact screen center for hanging the SpyderX2
+                        // Draw target reticle in exact screen center for hanging the Spyder sensor
                         let box_size = egui::vec2(260.0, 260.0);
                         let target_rect = egui::Rect::from_center_size(center, box_size);
                         painter.rect_stroke(
@@ -1312,7 +1596,7 @@ impl eframe::App for YutaniApp {
                         // Top telemetry HUD (outside the center optical patch)
                         ui.vertical(|ui| {
                             ui.heading(
-                                "MU-TH-UR 6000 // LIVE OSD WHITE-POINT (D65) & LUMINANCE ALIGNMENT",
+                                "YUTANI WAYLAND // LIVE OSD WHITE-POINT (D65) & LUMINANCE ALIGNMENT",
                             );
                             ui.label(format!(
                                 "Adjust {} OSD Brightness & RGB Gain while sensor reads center white patch.",
@@ -1556,11 +1840,19 @@ impl eframe::App for YutaniApp {
                         let (rx, ry, _) = measurements.red.to_xyy();
                         let (gx, gy, _) = measurements.green.to_xyy();
                         let (bx, by, _) = measurements.blue.to_xyy();
+                        let tgt_prim = current_gamut.reference_primaries_xy();
+                        let err_r = ((rx - tgt_prim[0].0).powi(2) + (ry - tgt_prim[0].1).powi(2)).sqrt();
+                        let err_g = ((gx - tgt_prim[1].0).powi(2) + (gy - tgt_prim[1].1).powi(2)).sqrt();
+                        let err_b = ((bx - tgt_prim[2].0).powi(2) + (by - tgt_prim[2].1).powi(2)).sqrt();
 
                         ui.label(format!(
                             "DISPLAY TARGET  : {} ({})",
                             current_display.full_name(),
                             current_display.panel_spec()
+                        ));
+                        ui.label(format!(
+                            "COLOR GAMUT     : {}",
+                            current_gamut.display_label()
                         ));
                         ui.label(format!("TARGET EOTF     : {}", current_eotf.display_label()));
                         ui.label(format!(
@@ -1580,8 +1872,15 @@ impl eframe::App for YutaniApp {
                             ));
                         }
                         ui.label(format!(
-                            "PRIMARIES (xy)  : R({:.4}, {:.4})  G({:.4}, {:.4})  B({:.4}, {:.4})",
+                            "MEASURED RGB xy : R({:.4}, {:.4})  G({:.4}, {:.4})  B({:.4}, {:.4})",
                             rx, ry, gx, gy, bx, by
+                        ));
+                        ui.label(format!(
+                            "GAMUT Δxy vs {:<6}: ΔR = {:.4}  |  ΔG = {:.4}  |  ΔB = {:.4}",
+                            current_gamut.short_code(),
+                            err_r,
+                            err_g,
+                            err_b
                         ));
                         ui.label(format!(
                             "D65 VCGT GAINS  : R = {:.1}% | G = {:.1}% | B = {:.1}% (Inversion: {})",
@@ -1595,10 +1894,13 @@ impl eframe::App for YutaniApp {
                             }
                         ));
                         ui.label(format!(
-                            "VCGT @ 50% IN   : R_out = {:.3} | G_out = {:.3} | B_out = {:.3}",
+                            "VCGT @ 50% IN   : R_out = {:.3} ({:+.1}%) | G_out = {:.3} ({:+.1}%) | B_out = {:.3} ({:+.1}%)",
                             vcgt_summary.midtone_50_vcgt[0],
+                            (vcgt_summary.midtone_50_vcgt[0] - 0.5) * 100.0,
                             vcgt_summary.midtone_50_vcgt[1],
-                            vcgt_summary.midtone_50_vcgt[2]
+                            (vcgt_summary.midtone_50_vcgt[1] - 0.5) * 100.0,
+                            vcgt_summary.midtone_50_vcgt[2],
+                            (vcgt_summary.midtone_50_vcgt[2] - 0.5) * 100.0,
                         ));
 
                         ui.add_space(8.0);
@@ -1606,24 +1908,42 @@ impl eframe::App for YutaniApp {
                         ui.horizontal_wrapped(|ui| {
                             draw_eotf_graph(ui, measurements, current_eotf);
                             ui.add_space(12.0);
-                            draw_cie_gamut_graph(ui, measurements);
+                            draw_cie_gamut_graph(ui, measurements, current_gamut);
                         });
 
                         ui.add_space(8.0);
                         ui.separator();
-                        ui.label("GRAYSCALE EOTF TRACKING (MEASURED vs. TARGET):");
+                        draw_vcgt_correction_graph(ui, vcgt_summary);
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label("GRAYSCALE EOTF TRACKING & APPLIED 8-BIT VCGT LUT CORRECTION:");
                         for (v, reading) in &measurements.grayscale {
                             let target_y = eotf_target_luminance(*v, lw, lb, current_eotf);
                             let (gx, gy, meas_y) = reading.to_xyy();
+                            let dy = meas_y - target_y;
                             let (_, _, de) = compute_d65_alignment_metrics(reading);
+                            let in_8bit = (v * 255.0).round() as i32;
+                            let lut_rgb = vcgt_summary.sample_rgb(*v);
+                            let r_8bit = (lut_rgb[0] * 255.0).round() as i32;
+                            let g_8bit = (lut_rgb[1] * 255.0).round() as i32;
+                            let b_8bit = (lut_rgb[2] * 255.0).round() as i32;
                             ui.monospace(format!(
-                                "  {:>3.0}% | Meas: {:>7.3} cd/m² | Target: {:>7.3} cd/m² | xy: ({:.4}, {:.4}) | ΔE(D65): {:.2}",
+                                "  {:>3.0}% (In {:>3}) | Meas: {:>6.2} | Tgt: {:>6.2} (ΔY {:+5.2}) | xy:({:.4},{:.4}) ΔE:{:>4.2} | LUT Out R:{:>3}({:+3}) G:{:>3}({:+3}) B:{:>3}({:+3})",
                                 v * 100.0,
+                                in_8bit,
                                 meas_y,
                                 target_y,
+                                dy,
                                 gx,
                                 gy,
-                                de
+                                de,
+                                r_8bit,
+                                r_8bit - in_8bit,
+                                g_8bit,
+                                g_8bit - in_8bit,
+                                b_8bit,
+                                b_8bit - in_8bit,
                             ));
                         }
 
@@ -1638,7 +1958,7 @@ impl eframe::App for YutaniApp {
                         );
 
                         ui.add_space(12.0);
-                        if ui.button(" [ RETURN TO MU-TH-UR CONSOLE ] ").clicked() {
+                        if ui.button(" [ RETURN TO YUTANI CONSOLE ] ").clicked() {
                             back_to_dash = true;
                         }
                     });

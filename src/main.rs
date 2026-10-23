@@ -26,6 +26,9 @@ enum Command {
         /// Display model target (pa32ucdm, pa279crv, mq16ahe)
         #[arg(short, long, default_value = "pa32ucdm")]
         display: String,
+        /// Target color gamut space (rec709, p3, native)
+        #[arg(long, default_value = "rec709")]
+        gamut: String,
         /// Target gamma exponent (e.g. 2.4, 2.2, 2.6)
         #[arg(short, long, default_value_t = 2.4)]
         gamma: f64,
@@ -54,11 +57,13 @@ fn main() -> Result<()> {
             Command::Probe => driver::spyder::probe()?,
             Command::Calibrate {
                 display,
+                gamut,
                 gamma,
                 pure_power,
                 srgb,
             } => {
                 let target_display = icc::DisplayTarget::from_cli_str(&display);
+                let target_gamut = icc::ColorGamut::from_cli_str(&gamut);
                 let eotf = if srgb {
                     icc::EotfConfig::Srgb
                 } else if pure_power {
@@ -67,8 +72,9 @@ fn main() -> Result<()> {
                     icc::EotfConfig::Bt1886 { gamma }
                 };
                 println!(
-                    "Starting CLI spot measurement & profile generation for {} ({})...",
+                    "Starting CLI spot measurement & profile generation for {} [{}] ({})...",
                     target_display.full_name(),
+                    target_gamut.display_label(),
                     eotf.display_label()
                 );
                 match driver::spyder::SpyderSession::open() {
@@ -86,6 +92,7 @@ fn main() -> Result<()> {
                         };
                         icc::generate_bt1886_profile_with_eotf(
                             target_display,
+                            target_gamut,
                             white_lum,
                             target_display.fallback_black_nits(),
                             eotf,
@@ -98,6 +105,7 @@ fn main() -> Result<()> {
                         );
                         icc::generate_bt1886_profile_with_eotf(
                             target_display,
+                            target_gamut,
                             target_display.default_target_nits(),
                             target_display.fallback_black_nits(),
                             eotf,

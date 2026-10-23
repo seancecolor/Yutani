@@ -81,6 +81,83 @@ impl DisplayTarget {
     }
 }
 
+/// Target color gamut space for calibration and ICC profile primary metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorGamut {
+    /// ITU-R BT.709 / sRGB standard gamut (D65 whitepoint).
+    #[default]
+    Rec709,
+    /// Display P3 / P3-D65 wide color gamut (DCI-P3 primaries with D65 whitepoint).
+    DisplayP3,
+    /// Native panel gamut (uses measured R, G, B primary chromaticities directly).
+    Native,
+}
+
+impl ColorGamut {
+    pub const ALL: [ColorGamut; 3] = [
+        ColorGamut::Rec709,
+        ColorGamut::DisplayP3,
+        ColorGamut::Native,
+    ];
+
+    pub fn from_cli_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "p3" | "displayp3" | "display-p3" | "dcip3" | "dci-p3" => Self::DisplayP3,
+            "native" | "wide" | "panel" => Self::Native,
+            _ => Self::Rec709,
+        }
+    }
+
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::Rec709 => "Rec709",
+            Self::DisplayP3 => "P3",
+            Self::Native => "Native",
+        }
+    }
+
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Rec709 => "ITU-R BT.709 / sRGB (D65)",
+            Self::DisplayP3 => "Display P3 / P3-D65 Wide Gamut",
+            Self::Native => "Native Panel Gamut (D65 White)",
+        }
+    }
+
+    pub fn button_label(self) -> &'static str {
+        match self {
+            Self::Rec709 => " [ REC.709 / sRGB ] ",
+            Self::DisplayP3 => " [ DISPLAY P3 (D65) ] ",
+            Self::Native => " [ NATIVE WIDE GAMUT ] ",
+        }
+    }
+
+    /// Reference CIE 1931 `(x, y)` coordinates for Red, Green, Blue primaries of this target space.
+    /// For `Native`, returns P3-D65 as the reference comparison triangle on charts.
+    pub fn reference_primaries_xy(self) -> [(f64, f64); 3] {
+        match self {
+            Self::Rec709 => [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)],
+            Self::DisplayP3 | Self::Native => [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
+        }
+    }
+
+    /// Reference `CIExyYTRIPLE` for `lcms2` profile construction.
+    pub fn lcms_primaries(self) -> CIExyYTRIPLE {
+        match self {
+            Self::Rec709 => CIExyYTRIPLE {
+                Red: CIExyY { x: 0.640, y: 0.330, Y: 0.2126 },
+                Green: CIExyY { x: 0.300, y: 0.600, Y: 0.7152 },
+                Blue: CIExyY { x: 0.150, y: 0.060, Y: 0.0722 },
+            },
+            Self::DisplayP3 | Self::Native => CIExyYTRIPLE {
+                Red: CIExyY { x: 0.680, y: 0.320, Y: 0.22897 },
+                Green: CIExyY { x: 0.265, y: 0.690, Y: 0.69174 },
+                Blue: CIExyY { x: 0.150, y: 0.060, Y: 0.07929 },
+            },
+        }
+    }
+}
+
 /// Electro-Optical Transfer Function (EOTF) / Gamma mode for calibration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EotfConfig {
@@ -116,18 +193,19 @@ impl EotfConfig {
         }
     }
 
-    pub fn filename_for(self, target: DisplayTarget) -> String {
+    pub fn filename_for(self, target: DisplayTarget, gamut: ColorGamut) -> String {
         let model = target.short_code();
+        let g_code = gamut.short_code();
         match self {
             Self::Bt1886 { gamma } => {
                 if (gamma - 2.4).abs() < 0.005 {
-                    format!("Yutani_{model}_BT1886.icc")
+                    format!("Yutani_{model}_{g_code}_BT1886.icc")
                 } else {
-                    format!("Yutani_{model}_BT1886_G{gamma:.2}.icc")
+                    format!("Yutani_{model}_{g_code}_BT1886_G{gamma:.2}.icc")
                 }
             }
-            Self::PurePower { gamma } => format!("Yutani_{model}_Gamma_{gamma:.2}.icc"),
-            Self::Srgb => format!("Yutani_{model}_sRGB.icc"),
+            Self::PurePower { gamma } => format!("Yutani_{model}_{g_code}_Gamma_{gamma:.2}.icc"),
+            Self::Srgb => format!("Yutani_{model}_{g_code}_sRGB.icc"),
         }
     }
 }
@@ -213,8 +291,29 @@ pub struct VcgtSummary {
     pub d65_rgb_gains: [f64; 3],
     /// VCGT output value (normalized `0.0..=1.0`) at 50% input stimulus for `[R, G, B]`.
     pub midtone_50_vcgt: [f64; 3],
+    /// Full 1024-entry normalized (`0.0..=1.0`) VCGT output curves for `[R, G, B]`.
+    pub lut_curves: [Vec<f64>; 3],
     /// Whether real optical measurements were used to invert the panel's native response.
     pub used_measured_inversion: bool,
+}
+
+impl VcgtSummary {
+    /// Sample the normalized (`0.0..=1.0`) VCGT output `[R, G, B]` at input level `v` (`0.0..=1.0`).
+    pub fn sample_rgb(&self, v: f64) -> [f64; 3] {
+        let v = v.clamp(0.0, 1.0);
+        let mut out = [v; 3];
+        for c in 0..3 {
+            let curve = &self.lut_curves[c];
+            if !curve.is_empty() {
+                let idx_f = v * ((curve.len() - 1) as f64);
+                let i0 = (idx_f.floor() as usize).min(curve.len() - 1);
+                let i1 = (i0 + 1).min(curve.len() - 1);
+                let frac = idx_f - (i0 as f64);
+                out[c] = curve[i0] + frac * (curve[i1] - curve[i0]);
+            }
+        }
+        out
+    }
 }
 
 /// Invert a 3x3 matrix `m`. Returns `None` if singular.
@@ -297,15 +396,18 @@ pub fn compute_vcgt_tables(
     if !valid_optical {
         // Fallback identity linear ramp when unmeasured (e.g. dry run with cap on)
         let mut ident = Vec::with_capacity(1024);
+        let mut ident_f = Vec::with_capacity(1024);
         for i in 0..1024 {
             let v = i as f64 / 1023.0;
             ident.push((v * 65535.0).round() as u16);
+            ident_f.push(v);
         }
         return (
             [ident.clone(), ident.clone(), ident],
             VcgtSummary {
                 d65_rgb_gains: [1.0, 1.0, 1.0],
                 midtone_50_vcgt: [0.5, 0.5, 0.5],
+                lut_curves: [ident_f.clone(), ident_f.clone(), ident_f],
                 used_measured_inversion: false,
             },
         );
@@ -426,6 +528,11 @@ pub fn compute_vcgt_tables(
         Vec::with_capacity(1024),
         Vec::with_capacity(1024),
     ];
+    let mut lut_curves: [Vec<f64>; 3] = [
+        Vec::with_capacity(1024),
+        Vec::with_capacity(1024),
+        Vec::with_capacity(1024),
+    ];
 
     for i in 0..1024 {
         let v = i as f64 / 1023.0;
@@ -439,6 +546,7 @@ pub fn compute_vcgt_tables(
             let drive_u = invert_measured_curve(&clean_curves[c], desired_y);
             let u16_val = (drive_u * 65535.0).round() as u16;
             vcgt[c].push(u16_val);
+            lut_curves[c].push(drive_u);
         }
     }
 
@@ -454,6 +562,7 @@ pub fn compute_vcgt_tables(
         VcgtSummary {
             d65_rgb_gains: d65_gains,
             midtone_50_vcgt,
+            lut_curves,
             used_measured_inversion: true,
         },
     )
@@ -462,12 +571,18 @@ pub fn compute_vcgt_tables(
 fn attach_metadata_and_vcgt(
     profile: &mut Profile,
     display: DisplayTarget,
+    gamut: ColorGamut,
     eotf: EotfConfig,
     vcgt_tables: &[Vec<u16>; 3],
 ) {
     let mut desc = MLU::new(1);
     desc.set_text(
-        &format!("Yutani {} - {}", display.full_name(), eotf.display_label()),
+        &format!(
+            "Yutani {} [{}] - {}",
+            display.full_name(),
+            gamut.short_code(),
+            eotf.display_label()
+        ),
         Locale::none(),
     );
     profile.write_tag(TagSignature::ProfileDescriptionTag, Tag::MLU(&desc));
@@ -486,9 +601,10 @@ fn attach_metadata_and_vcgt(
     profile.write_tag(TagSignature::VcgtTag, Tag::VcgtCurves(vcgt_refs));
 }
 
-/// Generate a baseline ICC profile from white/black luminance values, display target, and EOTF.
+/// Generate a baseline ICC profile from white/black luminance values, display target, gamut, and EOTF.
 pub fn generate_bt1886_profile_with_eotf(
     display: DisplayTarget,
+    gamut: ColorGamut,
     white_lum: f64,
     black_lum: f64,
     eotf: EotfConfig,
@@ -497,14 +613,9 @@ pub fn generate_bt1886_profile_with_eotf(
     let trc_curve = ToneCurve::new_tabulated(&curve_data);
     let curves = [&trc_curve, &trc_curve, &trc_curve];
 
-    // BT.709 primaries used as baseline when unmeasured
     let mut profile = Profile::new_rgb(
         &CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 },
-        &CIExyYTRIPLE {
-            Red: CIExyY { x: 0.64, y: 0.33, Y: 0.2126 },
-            Green: CIExyY { x: 0.30, y: 0.60, Y: 0.7152 },
-            Blue: CIExyY { x: 0.15, y: 0.06, Y: 0.0722 },
-        },
+        &gamut.lcms_primaries(),
         &curves,
     )
     .unwrap();
@@ -517,11 +628,12 @@ pub fn generate_bt1886_profile_with_eotf(
     attach_metadata_and_vcgt(
         &mut profile,
         display,
+        gamut,
         eotf,
         &[ident.clone(), ident.clone(), ident],
     );
 
-    let filename = eotf.filename_for(display);
+    let filename = eotf.filename_for(display, gamut);
     profile
         .save_profile_to_file(Path::new(&filename))
         .unwrap();
@@ -529,11 +641,12 @@ pub fn generate_bt1886_profile_with_eotf(
 }
 
 /// Generate a calibrated ICC profile from real Spyder sensor measurements, display target,
-/// and chosen EOTF, computing the inverted 3-channel `vcgt` LUTs and saving to both the
-/// working directory and `~/.local/share/icc/`.
+/// color gamut space, and chosen EOTF, computing the inverted 3-channel `vcgt` LUTs and saving
+/// to both the working directory and `~/.local/share/icc/`.
 pub fn generate_profile_from_measurements(
     meas: &CalibrationMeasurements,
     display: DisplayTarget,
+    gamut: ColorGamut,
     eotf: EotfConfig,
 ) -> Result<(Vec<PathBuf>, VcgtSummary)> {
     // If white luminance is near-zero (e.g. cap was left on during a dry run),
@@ -584,11 +697,7 @@ pub fn generate_profile_from_measurements(
             },
         }
     } else {
-        CIExyYTRIPLE {
-            Red: CIExyY { x: 0.64, y: 0.33, Y: 0.2126 },
-            Green: CIExyY { x: 0.30, y: 0.60, Y: 0.7152 },
-            Blue: CIExyY { x: 0.15, y: 0.06, Y: 0.0722 },
-        }
+        gamut.lcms_primaries()
     };
 
     let curve_data = build_eotf_lut(white_lum, black_lum, eotf);
@@ -600,10 +709,10 @@ pub fn generate_profile_from_measurements(
 
     // Compute real measured-curve inversion & D65 grey-balance VCGT tables
     let (vcgt_tables, vcgt_summary) = compute_vcgt_tables(meas, eotf);
-    attach_metadata_and_vcgt(&mut profile, display, eotf, &vcgt_tables);
+    attach_metadata_and_vcgt(&mut profile, display, gamut, eotf, &vcgt_tables);
 
     let mut saved_paths = Vec::new();
-    let filename = eotf.filename_for(display);
+    let filename = eotf.filename_for(display, gamut);
 
     let local_path = PathBuf::from(&filename);
     profile
