@@ -6,6 +6,81 @@ use lcms2::{
 
 use crate::driver::spyder::XyzReading;
 
+/// Supported ASUS monitor models for calibration and ICC profile tagging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DisplayTarget {
+    /// ASUS ProArt PA32UCDM — 31.5" 4K UHD 240Hz QD-OLED reference monitor.
+    #[default]
+    Pa32Ucdm,
+    /// ASUS ProArt PA279CRV — 27" 4K UHD IPS LED monitor (~1000:1 contrast).
+    Pa279Crv,
+    /// ASUS ZenScreen MQ16AHE — 15.6" FHD Portable OLED monitor.
+    Mq16Ahe,
+}
+
+impl DisplayTarget {
+    pub const ALL: [DisplayTarget; 3] = [
+        DisplayTarget::Pa32Ucdm,
+        DisplayTarget::Pa279Crv,
+        DisplayTarget::Mq16Ahe,
+    ];
+
+    pub fn from_cli_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pa279crv" | "279" | "pa279" => Self::Pa279Crv,
+            "mq16ahe" | "mq16" | "zenscreen" => Self::Mq16Ahe,
+            _ => Self::Pa32Ucdm,
+        }
+    }
+
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::Pa32Ucdm => "PA32UCDM",
+            Self::Pa279Crv => "PA279CRV",
+            Self::Mq16Ahe => "MQ16AHE",
+        }
+    }
+
+    pub fn full_name(self) -> &'static str {
+        match self {
+            Self::Pa32Ucdm => "ASUS ProArt PA32UCDM",
+            Self::Pa279Crv => "ASUS ProArt PA279CRV",
+            Self::Mq16Ahe => "ASUS ZenScreen MQ16AHE",
+        }
+    }
+
+    pub fn panel_spec(self) -> &'static str {
+        match self {
+            Self::Pa32Ucdm => "31.5\" 4K UHD QD-OLED (240Hz // True Zero-Black)",
+            Self::Pa279Crv => "27.0\" 4K UHD IPS LED (60Hz // ~1000:1 Backlit)",
+            Self::Mq16Ahe => "15.6\" FHD Portable OLED (60Hz // True Zero-Black)",
+        }
+    }
+
+    pub fn button_label(self) -> &'static str {
+        match self {
+            Self::Pa32Ucdm => " [ ASUS PA32UCDM (32\" QD-OLED) ] ",
+            Self::Pa279Crv => " [ ASUS PA279CRV (27\" 4K IPS) ] ",
+            Self::Mq16Ahe => " [ ASUS MQ16AHE (16\" OLED) ] ",
+        }
+    }
+
+    pub fn default_target_nits(self) -> f64 {
+        match self {
+            Self::Pa32Ucdm => 100.0,
+            Self::Pa279Crv => 120.0,
+            Self::Mq16Ahe => 100.0,
+        }
+    }
+
+    pub fn fallback_black_nits(self) -> f64 {
+        match self {
+            Self::Pa32Ucdm | Self::Mq16Ahe => 0.0005,
+            Self::Pa279Crv => 0.10,
+        }
+    }
+}
+
 /// Electro-Optical Transfer Function (EOTF) / Gamma mode for calibration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EotfConfig {
@@ -41,17 +116,18 @@ impl EotfConfig {
         }
     }
 
-    pub fn filename_slug(self) -> String {
+    pub fn filename_for(self, target: DisplayTarget) -> String {
+        let model = target.short_code();
         match self {
             Self::Bt1886 { gamma } => {
                 if (gamma - 2.4).abs() < 0.005 {
-                    String::from("Yutani_PA32UCDM_BT1886.icc")
+                    format!("Yutani_{model}_BT1886.icc")
                 } else {
-                    format!("Yutani_PA32UCDM_BT1886_G{gamma:.2}.icc")
+                    format!("Yutani_{model}_BT1886_G{gamma:.2}.icc")
                 }
             }
-            Self::PurePower { gamma } => format!("Yutani_PA32UCDM_Gamma_{gamma:.2}.icc"),
-            Self::Srgb => String::from("Yutani_PA32UCDM_sRGB.icc"),
+            Self::PurePower { gamma } => format!("Yutani_{model}_Gamma_{gamma:.2}.icc"),
+            Self::Srgb => format!("Yutani_{model}_sRGB.icc"),
         }
     }
 }
@@ -385,12 +461,13 @@ pub fn compute_vcgt_tables(
 
 fn attach_metadata_and_vcgt(
     profile: &mut Profile,
+    display: DisplayTarget,
     eotf: EotfConfig,
     vcgt_tables: &[Vec<u16>; 3],
 ) {
     let mut desc = MLU::new(1);
     desc.set_text(
-        &format!("Yutani ASUS PA32UCDM - {}", eotf.display_label()),
+        &format!("Yutani {} - {}", display.full_name(), eotf.display_label()),
         Locale::none(),
     );
     profile.write_tag(TagSignature::ProfileDescriptionTag, Tag::MLU(&desc));
@@ -408,8 +485,14 @@ fn attach_metadata_and_vcgt(
     let vcgt_refs: [&ToneCurveRef; 3] = [&vcgt_r, &vcgt_g, &vcgt_b];
     profile.write_tag(TagSignature::VcgtTag, Tag::VcgtCurves(vcgt_refs));
 }
-/// Generate a baseline ICC profile from white/black luminance values and EOTF configuration.
-pub fn generate_bt1886_profile_with_eotf(white_lum: f64, black_lum: f64, eotf: EotfConfig) {
+
+/// Generate a baseline ICC profile from white/black luminance values, display target, and EOTF.
+pub fn generate_bt1886_profile_with_eotf(
+    display: DisplayTarget,
+    white_lum: f64,
+    black_lum: f64,
+    eotf: EotfConfig,
+) {
     let curve_data = build_eotf_lut(white_lum, black_lum, eotf);
     let trc_curve = ToneCurve::new_tabulated(&curve_data);
     let curves = [&trc_curve, &trc_curve, &trc_curve];
@@ -431,30 +514,36 @@ pub fn generate_bt1886_profile_with_eotf(white_lum: f64, black_lum: f64, eotf: E
     for i in 0..1024 {
         ident.push(((i as f64 / 1023.0) * 65535.0).round() as u16);
     }
-    attach_metadata_and_vcgt(&mut profile, eotf, &[ident.clone(), ident.clone(), ident]);
+    attach_metadata_and_vcgt(
+        &mut profile,
+        display,
+        eotf,
+        &[ident.clone(), ident.clone(), ident],
+    );
 
-    let filename = eotf.filename_slug();
+    let filename = eotf.filename_for(display);
     profile
         .save_profile_to_file(Path::new(&filename))
         .unwrap();
     println!("Saved {filename}");
 }
 
-/// Generate a calibrated ICC profile from real Spyder sensor measurements and chosen EOTF,
-/// computing the inverted 3-channel `vcgt` LUTs and saving to both the working directory
-/// and `~/.local/share/icc/`.
+/// Generate a calibrated ICC profile from real Spyder sensor measurements, display target,
+/// and chosen EOTF, computing the inverted 3-channel `vcgt` LUTs and saving to both the
+/// working directory and `~/.local/share/icc/`.
 pub fn generate_profile_from_measurements(
     meas: &CalibrationMeasurements,
+    display: DisplayTarget,
     eotf: EotfConfig,
 ) -> Result<(Vec<PathBuf>, VcgtSummary)> {
     // If white luminance is near-zero (e.g. cap was left on during a dry run),
-    // fall back to sensible 100-nit / D65 / BT.709 defaults so profile creation still succeeds.
+    // fall back to sensible display defaults so profile creation still succeeds.
     let valid_optical = meas.white.y > 1.0 && (meas.red.y + meas.green.y + meas.blue.y) > 0.5;
 
     let (white_lum, black_lum) = if valid_optical {
         (meas.white.y, meas.black.y.min(meas.white.y * 0.1))
     } else {
-        (100.0, 0.05)
+        (display.default_target_nits(), display.fallback_black_nits())
     };
 
     let white_xyy = if valid_optical {
@@ -511,10 +600,10 @@ pub fn generate_profile_from_measurements(
 
     // Compute real measured-curve inversion & D65 grey-balance VCGT tables
     let (vcgt_tables, vcgt_summary) = compute_vcgt_tables(meas, eotf);
-    attach_metadata_and_vcgt(&mut profile, eotf, &vcgt_tables);
+    attach_metadata_and_vcgt(&mut profile, display, eotf, &vcgt_tables);
 
     let mut saved_paths = Vec::new();
-    let filename = eotf.filename_slug();
+    let filename = eotf.filename_for(display);
 
     let local_path = PathBuf::from(&filename);
     profile

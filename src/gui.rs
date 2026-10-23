@@ -6,8 +6,11 @@ use eframe::egui;
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
     bt1886_params, eotf_target_luminance, generate_profile_from_measurements,
-    CalibrationMeasurements, EotfConfig, VcgtSummary,
+    CalibrationMeasurements, DisplayTarget, EotfConfig, VcgtSummary,
 };
+
+/// Duration of the MU-TH-UR 6000 / Weyland-Yutani startup CRT animation.
+const BOOT_SEQUENCE_DURATION: Duration = Duration::from_millis(3400);
 
 /// Time to let the display panel settle on a new color patch before triggering the sensor read.
 const PATCH_SETTLE_DURATION: Duration = Duration::from_millis(450);
@@ -566,7 +569,215 @@ fn draw_cie_gamut_graph(ui: &mut egui::Ui, measurements: &CalibrationMeasurement
     });
 }
 
+/// Render the animated Weyland-Yutani / MU-TH-UR 6000 vector wireframe boot sequence.
+fn draw_boot_sequence(
+    ui: &mut egui::Ui,
+    progress: f32,
+    sensor_status: &str,
+) -> bool {
+    let mut skip = false;
+    let rect = ui.max_rect();
+    let center = rect.center();
+    let painter = ui.painter();
+
+    let bg_black = egui::Color32::from_rgb(6, 6, 5);
+    let amber = egui::Color32::from_rgb(255, 180, 40);
+    let bright_amber = egui::Color32::from_rgb(255, 225, 120);
+    let dim_amber = egui::Color32::from_rgb(95, 65, 16);
+    let faint_grid = egui::Color32::from_rgb(22, 16, 6);
+
+    painter.rect_filled(rect, 0.0, bg_black);
+
+    // Subtle horizontal CRT scanlines + sweeping phosphor beam
+    let scan_step = 6.0;
+    let mut y_scan = rect.top();
+    while y_scan < rect.bottom() {
+        painter.line_segment(
+            [egui::pos2(rect.left(), y_scan), egui::pos2(rect.right(), y_scan)],
+            egui::Stroke::new(1.0_f32, faint_grid),
+        );
+        y_scan += scan_step;
+    }
+
+    let beam_y = rect.top() + ((progress * 2.3).fract()) * rect.height();
+    painter.line_segment(
+        [egui::pos2(rect.left(), beam_y), egui::pos2(rect.right(), beam_y)],
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgba_unmultiplied(255, 190, 50, 55)),
+    );
+
+    // Outer CRT telemetry corner brackets
+    let m = 24.0;
+    let blen = 36.0;
+    let corners = [
+        (
+            egui::pos2(rect.left() + m, rect.top() + m),
+            egui::vec2(blen, 0.0),
+            egui::vec2(0.0, blen),
+        ),
+        (
+            egui::pos2(rect.right() - m, rect.top() + m),
+            egui::vec2(-blen, 0.0),
+            egui::vec2(0.0, blen),
+        ),
+        (
+            egui::pos2(rect.left() + m, rect.bottom() - m),
+            egui::vec2(blen, 0.0),
+            egui::vec2(0.0, -blen),
+        ),
+        (
+            egui::pos2(rect.right() - m, rect.bottom() - m),
+            egui::vec2(-blen, 0.0),
+            egui::vec2(0.0, -blen),
+        ),
+    ];
+    for (origin, dx, dy) in corners {
+        painter.line_segment([origin, origin + dx], egui::Stroke::new(2.0_f32, amber));
+        painter.line_segment([origin, origin + dy], egui::Stroke::new(2.0_f32, amber));
+    }
+
+    // Animated Vector Wireframe Emblem (Interlocking Winged W-Y Geometric Crest)
+    let logo_center = egui::pos2(center.x, rect.top() + 165.0);
+    let logo_alpha = (progress / 0.45).clamp(0.0, 1.0);
+    let wing_span = 180.0 * logo_alpha;
+    let wing_h = 68.0 * logo_alpha;
+
+    // Outer hexagonal/winged frame
+    let hex_pts = [
+        egui::pos2(logo_center.x - wing_span, logo_center.y - wing_h * 0.6),
+        egui::pos2(logo_center.x - wing_span * 0.45, logo_center.y - wing_h),
+        egui::pos2(logo_center.x + wing_span * 0.45, logo_center.y - wing_h),
+        egui::pos2(logo_center.x + wing_span, logo_center.y - wing_h * 0.6),
+        egui::pos2(logo_center.x + wing_span * 0.55, logo_center.y + wing_h),
+        egui::pos2(logo_center.x - wing_span * 0.55, logo_center.y + wing_h),
+    ];
+    for i in 0..hex_pts.len() {
+        let p0 = hex_pts[i];
+        let p1 = hex_pts[(i + 1) % hex_pts.len()];
+        painter.line_segment([p0, p1], egui::Stroke::new(1.5_f32, dim_amber));
+    }
+
+    // Vector "W / Y" interlocking chevron strokes
+    let w_scale = (progress / 0.55).clamp(0.0, 1.0);
+    if w_scale > 0.05 {
+        let w_pts = [
+            egui::pos2(logo_center.x - 115.0 * w_scale, logo_center.y - 36.0 * w_scale),
+            egui::pos2(logo_center.x - 62.0 * w_scale, logo_center.y + 38.0 * w_scale),
+            egui::pos2(logo_center.x, logo_center.y - 18.0 * w_scale),
+            egui::pos2(logo_center.x + 62.0 * w_scale, logo_center.y + 38.0 * w_scale),
+            egui::pos2(logo_center.x + 115.0 * w_scale, logo_center.y - 36.0 * w_scale),
+        ];
+        for win in w_pts.windows(2) {
+            painter.line_segment([win[0], win[1]], egui::Stroke::new(3.0_f32, bright_amber));
+        }
+        // Central Y-stem + optical target ring
+        painter.line_segment(
+            [
+                egui::pos2(logo_center.x, logo_center.y - 18.0 * w_scale),
+                egui::pos2(logo_center.x, logo_center.y + 52.0 * w_scale),
+            ],
+            egui::Stroke::new(2.5_f32, amber),
+        );
+        painter.circle_stroke(
+            logo_center,
+            42.0 * w_scale,
+            egui::Stroke::new(1.2_f32, amber),
+        );
+    }
+
+    painter.text(
+        egui::pos2(center.x, logo_center.y + 92.0),
+        egui::Align2::CENTER_CENTER,
+        "Y U T A N I   C O R P O R A T I O N",
+        egui::FontId::monospace(20.0),
+        bright_amber,
+    );
+    painter.text(
+        egui::pos2(center.x, logo_center.y + 116.0),
+        egui::Align2::CENTER_CENTER,
+        "MU-TH-UR 6000 // WAYLAND OPTICAL COLORIMETRY SUBSYSTEM",
+        egui::FontId::monospace(13.0),
+        amber,
+    );
+
+    // Teletype boot diagnostic lines revealed sequentially with progress
+    let boot_lines = [
+        (0.08_f32, "> INITIALISING MU-TH-UR 6000 MAINFRAME [ROM 2.104]... OK"),
+        (0.22_f32, "> ENGAGING KDE PLASMA WAYLAND COLOR MANAGEMENT BRIDGE... OK"),
+        (0.38_f32, "> LOADING TARGET MATRICES: ASUS PA32UCDM // PA279CRV // MQ16AHE... OK"),
+        (0.54_f32, "> CALIBRATING ITU-R BT.1886 & 3x1024 VCGT LUT SOLVER... OK"),
+        (0.70_f32, "> PROBING USB BUS (VID 0x085C) FOR DATACOLOR INSTRUMENTS..."),
+    ];
+
+    let log_left = center.x - 310.0;
+    let mut log_y = logo_center.y + 158.0;
+
+    for &(threshold, text) in &boot_lines {
+        if progress >= threshold {
+            let local_t = ((progress - threshold) / 0.14).clamp(0.0, 1.0);
+            let char_count = ((text.len() as f32) * local_t).ceil() as usize;
+            let slice: String = text.chars().take(char_count).collect();
+            painter.text(
+                egui::pos2(log_left, log_y),
+                egui::Align2::LEFT_CENTER,
+                slice,
+                egui::FontId::monospace(12.5),
+                amber,
+            );
+            log_y += 22.0;
+        }
+    }
+
+    if progress >= 0.82 {
+        let blink = ((progress * 18.0) as i32) % 2 == 0;
+        let cursor = if blink { " █" } else { "" };
+        painter.text(
+            egui::pos2(log_left, log_y),
+            egui::Align2::LEFT_CENTER,
+            format!("> {}{}", sensor_status, cursor),
+            egui::FontId::monospace(12.5),
+            bright_amber,
+        );
+    }
+
+    // Bottom progress bar + hex memory counter
+    let bar_w = 620.0;
+    let bar_rect = egui::Rect::from_center_size(
+        egui::pos2(center.x, rect.bottom() - 78.0),
+        egui::vec2(bar_w, 16.0),
+    );
+    painter.rect_stroke(bar_rect, 0.0, egui::Stroke::new(1.0_f32, amber));
+    let fill_rect = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.left() + 2.0, bar_rect.top() + 2.0),
+        egui::pos2(
+            bar_rect.left() + 2.0 + (bar_w - 4.0) * progress.clamp(0.0, 1.0),
+            bar_rect.bottom() - 2.0,
+        ),
+    );
+    painter.rect_filled(fill_rect, 0.0, amber);
+
+    let mem_addr = (progress.clamp(0.0, 1.0) * 65535.0) as u16;
+    painter.text(
+        egui::pos2(center.x, rect.bottom() - 48.0),
+        egui::Align2::CENTER_CENTER,
+        format!(
+            "SYSTEM INTEGRITY {:>3.0}% // MEM 0x{:04X} // [ PRESS SPACE OR CLICK TO ENTER CONSOLE ]",
+            progress * 100.0,
+            mem_addr
+        ),
+        egui::FontId::monospace(11.5),
+        dim_amber,
+    );
+
+    if ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_click()) {
+        skip = true;
+    }
+
+    skip
+}
+
 enum AppPhase {
+    /// Animated Weyland-Yutani / MU-TH-UR 6000 startup sequence.
+    BootSequence { started_at: Instant },
     /// Main MU-TH-UR 6000 control console.
     Dashboard,
     /// Fullscreen target reticle for physical sensor placement on the monitor.
@@ -598,6 +809,7 @@ struct YutaniApp {
     session: Option<SpyderSession>,
     status_log: String,
     last_single_read: Option<XyzReading>,
+    display_target: DisplayTarget,
     eotf: EotfConfig,
     target_nits: f64,
     phase: AppPhase,
@@ -606,13 +818,17 @@ struct YutaniApp {
 
 impl YutaniApp {
     fn new() -> Self {
+        let default_display = DisplayTarget::default();
         let mut app = Self {
             session: None,
             status_log: String::from("SYSTEM READY. INITIALISING INSTRUMENT LINK..."),
             last_single_read: None,
+            display_target: default_display,
             eotf: EotfConfig::default(),
-            target_nits: 100.0,
-            phase: AppPhase::Dashboard,
+            target_nits: default_display.default_target_nits(),
+            phase: AppPhase::BootSequence {
+                started_at: Instant::now(),
+            },
             theme_applied: false,
         };
         app.connect_sensor();
@@ -683,7 +899,7 @@ impl YutaniApp {
             grayscale,
         };
 
-        match generate_profile_from_measurements(&measurements, self.eotf) {
+        match generate_profile_from_measurements(&measurements, self.display_target, self.eotf) {
             Ok((saved_paths, vcgt_summary)) => {
                 self.status_log = format!(
                     "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S) WITH 3x1024 VCGT",
@@ -710,28 +926,79 @@ impl eframe::App for YutaniApp {
             self.theme_applied = true;
         }
 
-        // Global ESC key aborts fullscreen placement or measurement
+        // Global ESC key aborts fullscreen placement, measurement, or boot sequence
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if !matches!(self.phase, AppPhase::Dashboard) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                self.status_log = String::from("SEQUENCE ABORTED BY OPERATOR.");
                 self.phase = AppPhase::Dashboard;
             }
         }
 
         let current_eotf = self.eotf;
+        let current_display = self.display_target;
 
         match &mut self.phase {
+            AppPhase::BootSequence { started_at } => {
+                let elapsed = started_at.elapsed();
+                let progress = (elapsed.as_secs_f32() / BOOT_SEQUENCE_DURATION.as_secs_f32())
+                    .clamp(0.0, 1.0);
+                let skip_key = ctx.input(|i| {
+                    i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter)
+                });
+
+                let mut finish_boot = skip_key || elapsed >= BOOT_SEQUENCE_DURATION;
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if draw_boot_sequence(ui, progress, &self.status_log) {
+                        finish_boot = true;
+                    }
+                });
+
+                if finish_boot {
+                    self.phase = AppPhase::Dashboard;
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+            }
+
             AppPhase::Dashboard => {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("YUTANI CORP // WAYLAND COLORIMETRY SUBSYSTEM");
-                    ui.label("YUTANI DISPLAY PROFILER // BUILD BETTER COLORS");
+                    ui.horizontal(|ui| {
+                        ui.heading("YUTANI WAYLAND // COLORIMETRY SUBSYSTEM");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(" [ REPLAY BOOT ] ").clicked() {
+                                self.phase = AppPhase::BootSequence {
+                                    started_at: Instant::now(),
+                                };
+                            }
+                        });
+                    });
+                    ui.label("YUTANI DISPLAY PROFILER // BUILDING BETTER COLORS");
                     ui.separator();
 
-                    ui.add_space(8.0);
-                    ui.label("DISPLAY TARGET : ASUS ProArt PA32UCDM");
+                    ui.add_space(6.0);
+                    ui.label("SELECT DISPLAY TARGET:");
+                    ui.horizontal_wrapped(|ui| {
+                        for target in DisplayTarget::ALL {
+                            let is_sel = self.display_target == target;
+                            if ui.selectable_label(is_sel, target.button_label()).clicked() {
+                                self.display_target = target;
+                                self.target_nits = target.default_target_nits();
+                            }
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "DISPLAY TARGET : {} — {}",
+                        self.display_target.full_name(),
+                        self.display_target.panel_spec()
+                    ));
                     ui.label(format!("TARGET EOTF    : {}", self.eotf.display_label()));
-                    ui.label(format!("OUTPUT PROFILE : {}", self.eotf.filename_slug()));
+                    ui.label(format!(
+                        "OUTPUT PROFILE : {}",
+                        self.eotf.filename_for(self.display_target)
+                    ));
                     ui.label("TARGET WHITE   : CIE D65 (x = 0.3127, y = 0.3290)");
                     ui.label(format!("SENSOR STATUS  : {}", self.status_log));
 
@@ -966,8 +1233,14 @@ impl eframe::App for YutaniApp {
 
                         ui.vertical_centered(|ui| {
                             ui.add_space(32.0);
-                            ui.heading("ALIGN SPYDER SENSOR INSIDE CENTER RETICLE");
-                            ui.label("1. Remove sensor lens cap and place flush against the Asus PA32UCDM panel.");
+                            ui.heading(format!(
+                                "ALIGN SPYDER SENSOR ON {} CENTER RETICLE",
+                                current_display.full_name().to_ascii_uppercase()
+                            ));
+                            ui.label(format!(
+                                "1. Remove sensor lens cap and place flush against the {} panel.",
+                                current_display.full_name()
+                            ));
                             ui.label("2. Ensure KWin ICC profile is set to 'None' during raw panel characterization.");
                             ui.add_space(16.0);
                             ui.horizontal(|ui| {
@@ -1041,9 +1314,10 @@ impl eframe::App for YutaniApp {
                             ui.heading(
                                 "MU-TH-UR 6000 // LIVE OSD WHITE-POINT (D65) & LUMINANCE ALIGNMENT",
                             );
-                            ui.label(
-                                "Adjust Asus PA32UCDM OSD Brightness & RGB Gain while sensor reads center white patch.",
-                            );
+                            ui.label(format!(
+                                "Adjust {} OSD Brightness & RGB Gain while sensor reads center white patch.",
+                                current_display.full_name()
+                            ));
                             ui.separator();
 
                             ui.horizontal(|ui| {
@@ -1271,7 +1545,7 @@ impl eframe::App for YutaniApp {
                 let mut back_to_dash = false;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading("YUTANI CORP // CALIBRATION TELEMETRY REPORT");
+                        ui.heading("YUTANI WAYLAND // CALIBRATION TELEMETRY REPORT");
                         ui.separator();
 
                         let lw = measurements.white.y;
@@ -1283,6 +1557,11 @@ impl eframe::App for YutaniApp {
                         let (gx, gy, _) = measurements.green.to_xyy();
                         let (bx, by, _) = measurements.blue.to_xyy();
 
+                        ui.label(format!(
+                            "DISPLAY TARGET  : {} ({})",
+                            current_display.full_name(),
+                            current_display.panel_spec()
+                        ));
                         ui.label(format!("TARGET EOTF     : {}", current_eotf.display_label()));
                         ui.label(format!(
                             "PEAK WHITE (Lw) : {:.3} cd/m²  (CIE xy = {:.4}, {:.4})",

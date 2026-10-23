@@ -23,6 +23,9 @@ enum Command {
     },
     Probe,
     Calibrate {
+        /// Display model target (pa32ucdm, pa279crv, mq16ahe)
+        #[arg(short, long, default_value = "pa32ucdm")]
+        display: String,
         /// Target gamma exponent (e.g. 2.4, 2.2, 2.6)
         #[arg(short, long, default_value_t = 2.4)]
         gamma: f64,
@@ -50,10 +53,12 @@ fn main() -> Result<()> {
             Command::Detect { all } => driver::detect(all)?,
             Command::Probe => driver::spyder::probe()?,
             Command::Calibrate {
+                display,
                 gamma,
                 pure_power,
                 srgb,
             } => {
+                let target_display = icc::DisplayTarget::from_cli_str(&display);
                 let eotf = if srgb {
                     icc::EotfConfig::Srgb
                 } else if pure_power {
@@ -62,7 +67,8 @@ fn main() -> Result<()> {
                     icc::EotfConfig::Bt1886 { gamma }
                 };
                 println!(
-                    "Starting CLI spot measurement & profile generation ({})...",
+                    "Starting CLI spot measurement & profile generation for {} ({})...",
+                    target_display.full_name(),
                     eotf.display_label()
                 );
                 match driver::spyder::SpyderSession::open() {
@@ -73,12 +79,29 @@ fn main() -> Result<()> {
                             "Measured current screen: {:.3} cd/m² (CIE xy = {:.4}, {:.4})",
                             lum, x, y
                         );
-                        let white_lum = if lum > 5.0 { lum } else { 100.0 };
-                        icc::generate_bt1886_profile_with_eotf(white_lum, 0.05, eotf);
+                        let white_lum = if lum > 5.0 {
+                            lum
+                        } else {
+                            target_display.default_target_nits()
+                        };
+                        icc::generate_bt1886_profile_with_eotf(
+                            target_display,
+                            white_lum,
+                            target_display.fallback_black_nits(),
+                            eotf,
+                        );
                     }
                     Err(e) => {
-                        println!("Sensor unavailable ({e:#}); generating baseline 100-nit profile...");
-                        icc::generate_bt1886_profile_with_eotf(100.0, 0.05, eotf);
+                        println!(
+                            "Sensor unavailable ({e:#}); generating baseline profile for {}...",
+                            target_display.full_name()
+                        );
+                        icc::generate_bt1886_profile_with_eotf(
+                            target_display,
+                            target_display.default_target_nits(),
+                            target_display.fallback_black_nits(),
+                            eotf,
+                        );
                     }
                 }
             }
