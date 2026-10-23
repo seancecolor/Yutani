@@ -28,7 +28,9 @@ Observed devices: SpyderX2 (085c:0a0a), Spyder/SpyderPro 2024 (085c:0a0b).
 
 Ambient uses fixed integration time `0x65` and gain `0x10`.
 
-## Confirmed on hardware (2026-10-22, SpyderX2 085c:0a0a)
+## Confirmed on hardware (2026-10-22)
+
+### 1. SpyderX2 (`085c:0a0a`)
 - **Init (`c2 42 33 00 00`)**: 42-byte response.
   - Bytes `0..5`: `42 33 00 00 25` (nonce echo + 37-byte payload length)
   - Bytes `5..17`: ASCII `"5.5080005681"` (FW `5.50`, Serial `80005681`)
@@ -37,7 +39,10 @@ Ambient uses fixed integration time `0x65` and gain `0x10`.
   - Byte `6`: `v1` (`0x03`)
   - Bytes `7..9`: `v2` (`0x02ca` = 714 ms integration time, BE `u16`)
   - Bytes `9..15`: `00 01 02 03 04 05` (channel indices)
-  - Bytes `15..51`: Primary `3x3` XYZ calibration matrix (9 × `f32` LE, row-major X, Y, Z)
+  - Bytes `15..51`: Primary `3x3` XYZ calibration matrix (9 × `f32` LE, row-major X, Y, Z):
+    - `X`: `[+0.01795521, -0.00241139, +0.00018569]`
+    - `Y`: `[+0.00095543, +0.02324218, -0.00169498]`
+    - `Z`: `[+0.00646724, +0.00010066, +0.03711767]`
   - Bytes `51..87`: Secondary `3x3` matrix (9 × `f32` LE)
   - Bytes `87..111`: 3 × `(gain, offset)` pairs (6 × `f32` LE: `1.0, 0.0, 1.0, 0.0, 1.0, 0.0`)
   - Bytes `111..113`: `v3` (`0x01`), `v4` (`0xba`)
@@ -46,4 +51,14 @@ Ambient uses fixed integration time `0x65` and gain `0x10`.
   - Bytes `20..26` (6 bytes): `setup_off` per-channel baseline offset (`01 01 01 01 01 02`).
   - Byte `26`: `0xff`.
 - **Measure (`f2 29 27 00 0f` + `setup[5..20]`)**: Preceded by vendor reset control transfer (`0x41, 0x02, 0x0002, 0`). Returns 17 bytes (`5` header + `12` payload = six `u16` BE channel counts). First 3 channels (`ch[0..3]`) map via the `3x3` factory calibration matrix to CIE `XYZ` (in cd/m² nits).
+
+### 2. SpyderPro 2024 (`085c:0a0b`)
+- **Confirmed identical `SpyderX2` command set (`c2` / `f6` / `f7` / `f2`)**:
+  - **Init (`c2 42 33 00 00`)**: 42-byte response with ASCII `"6.0082022236"` (FW `6.00`, Serial `82022236`).
+  - **Factory Cal (`f6 5c 37 00 01 00`)**: 113-byte response, `v1 = 0x03`, `v2 = 714 ms`, unit-specific `3x3` XYZ matrix:
+    - `X`: `[+0.01939831, -0.00068778, -0.00006454]`
+    - `Y`: `[+0.00033139, +0.02312122, -0.00122486]`
+    - `Z`: `[+0.00653765, +0.00001205, +0.03675596]`
+  - **Setup (`f7 a1 c5 00 01 03`)**: 27-byte response (`s4 = bf 9f bf bf bf bf`, `setup_off = [1.0, 1.0, 1.0]`).
+  - **Measure (`f2 29 27 00 0f` + `setup[5..20]`)**: 17-byte response (`raw = [1, 1, 1]` dark counts with cap on).
 

@@ -120,9 +120,11 @@ impl XyzReading {
 /// Active, initialized session with a connected SpyderX / SpyderX2 / SpyderPro colorimeter.
 pub struct SpyderSession {
     handle: DeviceHandle<LibUsb>,
+    pub vid_pid: (u16, u16),
     pub cmd_set: CmdSet,
     pub model_name: &'static str,
-    pub firmware_serial: String,
+    pub firmware_version: String,
+    pub serial_number: String,
     pub integration_ms: u16,
     /// 3x3 sensor-to-XYZ calibration matrix (row-major: X, Y, Z).
     pub matrix: [[f64; 3]; 3],
@@ -133,15 +135,17 @@ pub struct SpyderSession {
     measure_resp_len: usize,
     /// Per-channel baseline offset returned by `setup(v1)`.
     pub setup_off: [f64; 3],
-    /// Optional dark/black calibration offset (`bcal`).
+    /// Measured dark-current calibration offset (`bcal`, with lens cap on).
     pub black_off: [f64; 3],
+    /// Whether `calibrate_black` (`bcal`) has been performed in this session.
+    pub black_calibrated: bool,
 }
 
 impl SpyderSession {
     /// Open the first recognised Datacolor instrument, run `init`, `factory_cal`,
     /// and `setup(v1)`, and return a ready-to-measure session.
     pub fn open() -> Result<Self> {
-        let (handle, model_name) = open_first_with_name()?;
+        let (handle, vid_pid, model_name) = open_first_with_name()?;
 
         for cmd_set in [CmdSet::SpyderX2, CmdSet::SpyderX] {
             let init_cmd = cmd_set.init_cmd();
@@ -150,11 +154,7 @@ impl SpyderSession {
                 Err(_) => continue,
             };
 
-            let firmware_serial = if init_resp.len() >= 17 {
-                String::from_utf8_lossy(&init_resp[5..17]).trim().to_string()
-            } else {
-                String::from("unknown")
-            };
+            let (firmware_version, serial_number) = parse_fw_and_serial(&init_resp);
 
             // Read factory calibration
             let cal_cmd = cmd_set.cal_cmd();
@@ -172,19 +172,24 @@ impl SpyderSession {
                 build_measure_frame(cmd_set, integration_ms, &setup)?;
 
             tracing::info!(
-                "initialised {} ({}) FW/SN={} v1={:#04x} int={}ms",
+                "initialised {} ({:04x}:{:04x}, {}) FW={} SN={} v1={:#04x} int={}ms",
                 model_name,
+                vid_pid.0,
+                vid_pid.1,
                 cmd_set.name(),
-                firmware_serial,
+                firmware_version,
+                serial_number,
                 v1,
                 integration_ms
             );
 
             return Ok(Self {
                 handle,
+                vid_pid,
                 cmd_set,
                 model_name,
-                firmware_serial,
+                firmware_version,
+                serial_number,
                 integration_ms,
                 matrix,
                 gain,
@@ -193,10 +198,59 @@ impl SpyderSession {
                 measure_resp_len,
                 setup_off,
                 black_off: [0.0; 3],
+                black_calibrated: false,
             });
         }
 
         bail!("instrument did not respond to SpyderX2 or SpyderX init frames (try unplugging and replugging)")
+    }
+
+    /// Perform dark-current zeroing (`bcal`) with the sensor lens cap closed.
+    ///
+    /// Takes two consecutive dark measurements, verifies that no ambient light is
+    /// leaking into the sensor (rejecting if raw counts > 50), and records the
+    /// residual thermal offset above `setup_off` in `self.black_off`.
+    pub fn calibrate_black(&mut self) -> Result<[f64; 3]> {
+        let mut accum = [0.0f64; 3];
+        const SAMPLES: usize = 2;
+
+        for _ in 0..SAMPLES {
+            reset(&self.handle)?;
+            let resp = transact(&self.handle, &self.measure_cmd, self.measure_resp_len)
+                .context("dark-current (bcal) bulk transfer failed")?;
+            if resp.len() < 11 {
+                bail!("dark-current response too short ({} bytes)", resp.len());
+            }
+
+            let mut raw = [0u16; 3];
+            for i in 0..3 {
+                raw[i] = u16::from_be_bytes([resp[5 + i * 2], resp[6 + i * 2]]);
+            }
+
+            // Reject if light is hitting the sensor (cap off)
+            if raw[0] > 50 || raw[1] > 50 || raw[2] > 50 {
+                bail!(
+                    "optical light detected (raw counts {:?}) — place the Spyder in its lens cap before zeroing dark current",
+                    raw
+                );
+            }
+
+            for i in 0..3 {
+                let net_dark = (raw[i] as f64 - self.setup_off[i]).max(0.0);
+                accum[i] += net_dark;
+            }
+        }
+
+        let bcal = [
+            accum[0] / SAMPLES as f64,
+            accum[1] / SAMPLES as f64,
+            accum[2] / SAMPLES as f64,
+        ];
+        self.black_off = bcal;
+        self.black_calibrated = true;
+
+        tracing::info!("dark-current bcal zeroed: {:?}", bcal);
+        Ok(bcal)
     }
 
     /// Take a single CIE XYZ measurement from the sensor.
@@ -250,6 +304,17 @@ impl SpyderSession {
             net_counts,
         })
     }
+}
+
+fn parse_fw_and_serial(init_resp: &[u8]) -> (String, String) {
+    if init_resp.len() >= 17 {
+        let raw = String::from_utf8_lossy(&init_resp[5..17]).trim().to_string();
+        if raw.len() >= 12 {
+            return (raw[..4].to_string(), raw[4..12].to_string());
+        }
+        return (raw, String::from("—"));
+    }
+    (String::from("unknown"), String::from("unknown"))
 }
 
 fn read_f32_le(bytes: &[u8], offset: usize) -> f64 {
@@ -347,7 +412,7 @@ fn build_measure_frame(
 }
 
 /// Find and open the first recognised Datacolor device on the bus.
-fn open_first_with_name() -> Result<(DeviceHandle<LibUsb>, &'static str)> {
+fn open_first_with_name() -> Result<(DeviceHandle<LibUsb>, (u16, u16), &'static str)> {
     let ctx = LibUsb::new().context("could not initialise libusb")?;
     let devices = ctx.devices().context("could not enumerate USB bus")?;
 
@@ -378,7 +443,7 @@ fn open_first_with_name() -> Result<(DeviceHandle<LibUsb>, &'static str)> {
             .context("could not claim interface 0")?;
 
         tracing::info!("opened {} ({vid:04x}:{pid:04x})", model_name);
-        return Ok((handle, model_name));
+        return Ok((handle, (vid, pid), model_name));
     }
 
     bail!("no recognised Datacolor colorimeter found — run `yutani detect` first")
@@ -438,10 +503,13 @@ fn hexdump(label: &str, data: &[u8]) {
 /// Open the meter, run the full init -> factory_cal -> setup -> measure handshake,
 /// and dump both raw frames and decoded colorimetric values.
 pub fn probe() -> Result<()> {
-    let (handle, model_name) = open_first_with_name()?;
+    let (handle, (vid, pid), model_name) = open_first_with_name()?;
 
     for cmd_set in [CmdSet::SpyderX2, CmdSet::SpyderX] {
-        println!("── probing {model_name} with {} command set ──", cmd_set.name());
+        println!(
+            "── probing {model_name} ({vid:04x}:{pid:04x}) with {} command set ──",
+            cmd_set.name()
+        );
 
         let cmd = cmd_set.init_cmd();
         hexdump(&format!("→ EP {EP_OUT:#04x} init write"), &cmd);
@@ -449,8 +517,9 @@ pub fn probe() -> Result<()> {
         match transact(&handle, &cmd, cmd_set.init_resp_len()) {
             Ok(resp) => {
                 hexdump(&format!("← EP {EP_IN:#04x} init read"), &resp);
+                let (fw, sn) = parse_fw_and_serial(&resp);
                 println!(
-                    "✅ {} responded — locking in {} protocol",
+                    "✅ {} responded — locking in {} protocol (FW: {fw}, SN: {sn})",
                     cmd_set.name(),
                     cmd_set.name()
                 );

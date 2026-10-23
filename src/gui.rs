@@ -313,10 +313,13 @@ impl YutaniApp {
         match SpyderSession::open() {
             Ok(s) => {
                 self.status_log = format!(
-                    "ONLINE: {} [{}] // FW+SN: {} // INT: {} ms",
+                    "ONLINE: {} [{:04x}:{:04x} // {}] // FW: {} // SN: {} // INT: {} ms",
                     s.model_name,
+                    s.vid_pid.0,
+                    s.vid_pid.1,
                     s.cmd_set.name(),
-                    s.firmware_serial,
+                    s.firmware_version,
+                    s.serial_number,
                     s.integration_ms
                 );
                 self.session = Some(s);
@@ -428,6 +431,15 @@ impl eframe::App for YutaniApp {
                             "MATRIX ROW Y   : [{:+.6}, {:+.6}, {:+.6}] (setup_off = {:?})",
                             s.matrix[1][0], s.matrix[1][1], s.matrix[1][2], s.setup_off
                         ));
+                        let bcal_str = if s.black_calibrated {
+                            format!(
+                                "ZEROED (CAP-ON VERIFIED) // bcal = [{:.2}, {:.2}, {:.2}] counts",
+                                s.black_off[0], s.black_off[1], s.black_off[2]
+                            )
+                        } else {
+                            String::from("UNCALIBRATED (FACTORY SETUP_OFF ONLY — CLOSE LENS CAP & CLICK ZERO DARK OFFSET)")
+                        };
+                        ui.label(format!("DARK OFFSET    : {bcal_str}"));
                     }
 
                     ui.add_space(12.0);
@@ -522,6 +534,22 @@ impl eframe::App for YutaniApp {
                         }
 
                         if self.session.is_some() {
+                            if ui.button(" [ ZERO DARK OFFSET (CAP ON) ] ").clicked() {
+                                if let Some(s) = &mut self.session {
+                                    match s.calibrate_black() {
+                                        Ok(bcal) => {
+                                            self.status_log = format!(
+                                                "DARK OFFSET ZEROED: bcal = [{:.2}, {:.2}, {:.2}] counts",
+                                                bcal[0], bcal[1], bcal[2]
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.status_log = format!("DARK ZERO FAILED: {e:#}");
+                                        }
+                                    }
+                                }
+                            }
+
                             if ui.button(" [ SINGLE READ (TEST SENSOR) ] ").clicked() {
                                 if let Some(s) = &self.session {
                                     match s.measure() {

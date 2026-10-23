@@ -26,14 +26,16 @@ pub const DATACOLOR_VID: u16 = 0x085c;
 /// Product IDs Yutani recognises, paired with a human-readable model name.
 ///
 /// Observed in the wild:
-///   - 0x0a0a — SpyderX2 (reports as "Datacolor SpyderX" in lsusb)
-///   - 0x0b0b — Spyder / SpyderPro (2024, same silicon as X2, newer firmware)
+///   - 0x0a00 — SpyderX (original)
+///   - 0x0a0a — SpyderX2 (reports as "Datacolor SpyderX" in lsusb, FW 5.50)
+///   - 0x0a0b — Spyder / SpyderPro (2024, same silicon as X2, FW 6.00)
 ///
 /// Both expose a vendor-specific bulk interface (class 0xff), so they are
 /// enumerated via libusb (`driver::usb`), not hidapi.
 pub const KNOWN_PRODUCTS: &[(u16, &str)] = &[
+    (0x0a00, "Datacolor SpyderX"),
     (0x0a0a, "Datacolor SpyderX2"),
-    (0x0a0b, "Datacolor Spyder (2024)"),
+    (0x0a0b, "Datacolor SpyderPro (2024)"),
 ];
 
 /// Look up a friendly name for a VID/PID pair, if we know it.
