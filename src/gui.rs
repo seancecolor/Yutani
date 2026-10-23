@@ -153,11 +153,121 @@ fn build_calibration_patches() -> Vec<PatchSpec> {
     patches
 }
 
+/// Interval between consecutive sensor reads in Live OSD Alignment mode.
+const OSD_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Compute D65-normalized linear RGB balance `(r_pct, g_pct, b_pct)`, Correlated Color
+/// Temperature `cct_kelvin`, and CIE 1976 `delta_e_ab` relative to CIE D65 whitepoint.
+fn compute_d65_alignment_metrics(reading: &XyzReading) -> ([f64; 3], f64, f64) {
+    let (cx, cy, lum) = reading.to_xyy();
+    if lum <= 1e-4 {
+        return ([100.0, 100.0, 100.0], 6504.0, 99.9);
+    }
+
+    // Standard CIE 1931 XYZ -> Linear BT.709 / sRGB (D65 white => R = G = B = Y)
+    let x = reading.x;
+    let y = reading.y;
+    let z = reading.z;
+    let r_lin = (3.2404542 * x - 1.5371385 * y - 0.4985314 * z).max(0.0);
+    let g_lin = (-0.9692660 * x + 1.8760108 * y + 0.0415560 * z).max(0.0);
+    let b_lin = (0.0556434 * x - 0.2040259 * y + 1.0572252 * z).max(0.0);
+
+    let avg = ((r_lin + g_lin + b_lin) / 3.0).max(1e-6);
+    let rgb_pct = [
+        (r_lin / avg) * 100.0,
+        (g_lin / avg) * 100.0,
+        (b_lin / avg) * 100.0,
+    ];
+
+    // McCamy's cubic approximation for Correlated Color Temperature (CCT in Kelvin)
+    let denom = (0.1858 - cy).abs().max(1e-6) * if 0.1858 - cy >= 0.0 { 1.0 } else { -1.0 };
+    let n = (cx - 0.3320) / denom;
+    let cct = (449.0 * n.powi(3) + 3525.0 * n.powi(2) + 6823.3 * n + 5520.33).clamp(1500.0, 25000.0);
+
+    // Chromaticity CIE Lab a*, b* delta against D65 (Xn=0.95047, Yn=1.0, Zn=1.08883) at equal luminance
+    let xn = y * (0.3127 / 0.3290);
+    let zn = y * ((1.0 - 0.3127 - 0.3290) / 0.3290);
+    let f = |t: f64| -> f64 {
+        let delta: f64 = 6.0 / 29.0;
+        if t > delta.powi(3) {
+            t.cbrt()
+        } else {
+            t / (3.0 * delta.powi(2)) + 4.0 / 29.0
+        }
+    };
+    let fx = f(x / xn.max(1e-6));
+    let fy = f(1.0);
+    let fz = f(z / zn.max(1e-6));
+    let a_star = 500.0 * (fx - fy);
+    let b_star = 200.0 * (fy - fz);
+    let delta_e = (a_star.powi(2) + b_star.powi(2)).sqrt();
+
+    (rgb_pct, cct, delta_e)
+}
+
+/// Draw a retro MU-TH-UR 6000 horizontal center-zero deviation gauge bar.
+fn draw_deviation_bar(
+    ui: &mut egui::Ui,
+    label: &str,
+    pct_diff: f64,
+    max_span_pct: f64,
+    bar_color: egui::Color32,
+    hint: &str,
+) {
+    let amber = egui::Color32::from_rgb(255, 180, 40);
+    let dim_amber = egui::Color32::from_rgb(90, 60, 15);
+    let bg_dark = egui::Color32::from_rgb(16, 14, 10);
+
+    ui.horizontal(|ui| {
+        ui.monospace(format!("{label:<14}"));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 18.0), egui::Sense::hover());
+        let painter = ui.painter();
+
+        painter.rect_filled(rect, 0.0, bg_dark);
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, dim_amber));
+
+        let center_x = rect.center().x;
+        let norm = (pct_diff / max_span_pct).clamp(-1.0, 1.0) as f32;
+        let fill_x = center_x + norm * (rect.width() * 0.5);
+
+        let bar_rect = if fill_x >= center_x {
+            egui::Rect::from_min_max(
+                egui::pos2(center_x, rect.top() + 2.0),
+                egui::pos2(fill_x, rect.bottom() - 2.0),
+            )
+        } else {
+            egui::Rect::from_min_max(
+                egui::pos2(fill_x, rect.top() + 2.0),
+                egui::pos2(center_x, rect.bottom() - 2.0),
+            )
+        };
+        painter.rect_filled(bar_rect, 0.0, bar_color);
+
+        // Center target tick line
+        painter.line_segment(
+            [
+                egui::pos2(center_x, rect.top()),
+                egui::pos2(center_x, rect.bottom()),
+            ],
+            egui::Stroke::new(2.0_f32, amber),
+        );
+
+        ui.monospace(format!(" {:+6.1}%  {}", pct_diff, hint));
+    });
+}
+
 enum AppPhase {
     /// Main MU-TH-UR 6000 control console.
     Dashboard,
     /// Fullscreen target reticle for physical sensor placement on the monitor.
     PlacementReticle,
+    /// Live continuous OSD Whitepoint (D65) & Luminance (Nits) alignment meter.
+    OsdAlignment {
+        last_poll: Instant,
+        paused: bool,
+        reading: Option<XyzReading>,
+        read_count: usize,
+    },
     /// Active fullscreen patch display and hardware measurement sequence.
     Measuring {
         patches: Vec<PatchSpec>,
@@ -179,6 +289,7 @@ struct YutaniApp {
     status_log: String,
     last_single_read: Option<XyzReading>,
     eotf: EotfConfig,
+    target_nits: f64,
     phase: AppPhase,
     theme_applied: bool,
 }
@@ -190,6 +301,7 @@ impl YutaniApp {
             status_log: String::from("SYSTEM READY. INITIALISING INSTRUMENT LINK..."),
             last_single_read: None,
             eotf: EotfConfig::default(),
+            target_nits: 100.0,
             phase: AppPhase::Dashboard,
             theme_applied: false,
         };
@@ -382,9 +494,29 @@ impl eframe::App for YutaniApp {
                         });
                     }
 
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("TARGET PEAK LUMINANCE (OSD):");
+                        for &preset in &[80.0, 100.0, 120.0, 160.0, 200.0] {
+                            let selected = (self.target_nits - preset).abs() < 0.5;
+                            if ui
+                                .selectable_label(selected, format!(" {:.0} cd/m² ", preset))
+                                .clicked()
+                            {
+                                self.target_nits = preset;
+                            }
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut self.target_nits, 40.0..=300.0)
+                                .step_by(5.0)
+                                .suffix(" cd/m²")
+                                .fixed_decimals(0),
+                        );
+                    });
+
                     ui.add_space(12.0);
                     ui.separator();
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button(" [ RE-SCAN USB INSTRUMENT ] ").clicked() {
                             self.connect_sensor();
                         }
@@ -405,7 +537,17 @@ impl eframe::App for YutaniApp {
                                             self.status_log = format!("READ FAILED: {e:#}");
                                         }
                                     }
-                                }
+                                 }
+                            }
+
+                            if ui.button(" [ LIVE OSD WHITE & NITS METER ] ").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                                self.phase = AppPhase::OsdAlignment {
+                                    last_poll: Instant::now() - OSD_POLL_INTERVAL,
+                                    paused: false,
+                                    reading: self.last_single_read,
+                                    read_count: 0,
+                                };
                             }
 
                             if ui.button(" [ INITIALIZE CALIBRATION SEQUENCE ] ").clicked() {
@@ -447,7 +589,9 @@ impl eframe::App for YutaniApp {
 
             AppPhase::PlacementReticle => {
                 let start_now = ctx.input(|i| i.key_pressed(egui::Key::Space));
+                let open_osd = ctx.input(|i| i.key_pressed(egui::Key::O));
                 let mut begin_sequence = start_now;
+                let mut launch_osd = open_osd;
                 let mut cancel = false;
 
                 egui::CentralPanel::default()
@@ -489,7 +633,10 @@ impl eframe::App for YutaniApp {
                             ui.label("2. Ensure KWin ICC profile is set to 'None' during raw panel characterization.");
                             ui.add_space(16.0);
                             ui.horizontal(|ui| {
-                                if ui.button(" [ ENGAGE 14-PATCH BT.1886 SEQUENCE (SPACE) ] ").clicked() {
+                                if ui.button(" [ LIVE OSD WHITE & NITS METER (O) ] ").clicked() {
+                                    launch_osd = true;
+                                }
+                                if ui.button(" [ ENGAGE 14-PATCH SEQUENCE (SPACE) ] ").clicked() {
                                     begin_sequence = true;
                                 }
                                 if ui.button(" [ ABORT (ESC) ] ").clicked() {
@@ -502,6 +649,14 @@ impl eframe::App for YutaniApp {
                 if cancel {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     self.phase = AppPhase::Dashboard;
+                } else if launch_osd {
+                    self.phase = AppPhase::OsdAlignment {
+                        last_poll: Instant::now() - OSD_POLL_INTERVAL,
+                        paused: false,
+                        reading: None,
+                        read_count: 0,
+                    };
+                    ctx.request_repaint();
                 } else if begin_sequence {
                     self.phase = AppPhase::Measuring {
                         patches: build_calibration_patches(),
@@ -511,6 +666,197 @@ impl eframe::App for YutaniApp {
                         readings: Vec::with_capacity(14),
                     };
                     ctx.request_repaint();
+                }
+            }
+
+            AppPhase::OsdAlignment {
+                last_poll,
+                paused,
+                reading,
+                read_count,
+            } => {
+                let start_cal = ctx.input(|i| i.key_pressed(egui::Key::Space));
+                let mut proceed_to_cal = start_cal;
+                let mut exit_to_dash = false;
+                let mut trigger_manual_read = false;
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default().fill(egui::Color32::from_rgb(8, 8, 8)))
+                    .show(ctx, |ui| {
+                        let rect = ui.max_rect();
+                        let center = rect.center();
+                        let painter = ui.painter();
+                        let amber = egui::Color32::from_rgb(255, 180, 40);
+
+                        // Pure 100% White (255, 255, 255) patch in the exact center for the Spyder sensor
+                        let patch_size = egui::vec2(300.0, 300.0);
+                        let patch_rect = egui::Rect::from_center_size(center, patch_size);
+                        painter.rect_filled(patch_rect, 0.0, egui::Color32::WHITE);
+                        painter.rect_stroke(
+                            patch_rect.expand(4.0),
+                            0.0,
+                            egui::Stroke::new(2.0_f32, amber),
+                        );
+
+                        // Top telemetry HUD (outside the center optical patch)
+                        ui.vertical(|ui| {
+                            ui.heading(
+                                "MU-TH-UR 6000 // LIVE OSD WHITE-POINT (D65) & LUMINANCE ALIGNMENT",
+                            );
+                            ui.label(
+                                "Adjust Asus PA32UCDM OSD Brightness & RGB Gain while sensor reads center white patch.",
+                            );
+                            ui.separator();
+
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "TARGET LUMINANCE: {:.0} cd/m²  |  TARGET WHITE: CIE D65 (x=0.3127, y=0.3290, 6504K)  |  SAMPLES: {}",
+                                    self.target_nits, *read_count
+                                ));
+                            });
+
+                            if let Some(r) = *reading {
+                                let (cx, cy, lum) = r.to_xyy();
+                                let (rgb_pct, cct, delta_e) = compute_d65_alignment_metrics(&r);
+                                let lum_diff_nits = lum - self.target_nits;
+                                let lum_diff_pct =
+                                    (lum_diff_nits / self.target_nits.max(1.0)) * 100.0;
+
+                                let lum_hint = if lum_diff_nits.abs() <= 2.0 {
+                                    "[ LUMINANCE LOCKED ]"
+                                } else if lum_diff_nits > 0.0 {
+                                    "LOWER OSD BRIGHTNESS"
+                                } else {
+                                    "RAISE OSD BRIGHTNESS"
+                                };
+
+                                draw_deviation_bar(
+                                    ui,
+                                    &format!("Y ({:.1} nit)", lum),
+                                    lum_diff_pct,
+                                    30.0,
+                                    egui::Color32::from_rgb(255, 190, 60),
+                                    lum_hint,
+                                );
+
+                                let r_diff = rgb_pct[0] - 100.0;
+                                let g_diff = rgb_pct[1] - 100.0;
+                                let b_diff = rgb_pct[2] - 100.0;
+
+                                draw_deviation_bar(
+                                    ui,
+                                    &format!("RED ({:.1}%)", rgb_pct[0]),
+                                    r_diff,
+                                    15.0,
+                                    egui::Color32::from_rgb(235, 65, 55),
+                                    if r_diff.abs() <= 1.0 {
+                                        "[ R LOCKED ]"
+                                    } else if r_diff > 0.0 {
+                                        "LOWER OSD RED GAIN"
+                                    } else {
+                                        "RAISE OSD RED GAIN"
+                                    },
+                                );
+                                draw_deviation_bar(
+                                    ui,
+                                    &format!("GRN ({:.1}%)", rgb_pct[1]),
+                                    g_diff,
+                                    15.0,
+                                    egui::Color32::from_rgb(65, 220, 85),
+                                    if g_diff.abs() <= 1.0 {
+                                        "[ G LOCKED ]"
+                                    } else if g_diff > 0.0 {
+                                        "LOWER OSD GREEN GAIN"
+                                    } else {
+                                        "RAISE OSD GREEN GAIN"
+                                    },
+                                );
+                                draw_deviation_bar(
+                                    ui,
+                                    &format!("BLU ({:.1}%)", rgb_pct[2]),
+                                    b_diff,
+                                    15.0,
+                                    egui::Color32::from_rgb(70, 145, 255),
+                                    if b_diff.abs() <= 1.0 {
+                                        "[ B LOCKED ]"
+                                    } else if b_diff > 0.0 {
+                                        "LOWER OSD BLUE GAIN"
+                                    } else {
+                                        "RAISE OSD BLUE GAIN"
+                                    },
+                                );
+
+                                let lock_status =
+                                    if delta_e < 1.0 && lum_diff_nits.abs() <= 2.0 {
+                                        "STATUS: [ D65 & LUMINANCE LOCKED // READY FOR 14-PATCH SWEEP ]"
+                                    } else if delta_e < 2.0 {
+                                        "STATUS: [ NEAR D65 SPEC (ΔE < 2.0) // FINE-TUNE OSD ]"
+                                    } else {
+                                        "STATUS: [ ADJUSTING OSD // ALIGN BARS TO CENTER TICK ]"
+                                    };
+
+                                ui.monospace(format!(
+                                    "CIE xy = ({:.4}, {:.4})  |  CCT = {:.0} K  |  ΔE(D65) = {:.2}  |  {}",
+                                    cx, cy, cct, delta_e, lock_status
+                                ));
+                            } else {
+                                ui.label("ACQUIRING INITIAL SENSOR READING FROM CENTER WHITE PATCH...");
+                            }
+
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let pause_label = if *paused {
+                                    " [ RESUME LIVE POLLING ] "
+                                } else {
+                                    " [ PAUSE LIVE POLLING ] "
+                                };
+                                if ui.button(pause_label).clicked() {
+                                    *paused = !*paused;
+                                }
+                                if *paused && ui.button(" [ SINGLE READ ] ").clicked() {
+                                    trigger_manual_read = true;
+                                }
+                                if ui
+                                    .button(" [ START 14-PATCH CALIBRATION (SPACE) ] ")
+                                    .clicked()
+                                {
+                                    proceed_to_cal = true;
+                                }
+                                if ui.button(" [ EXIT TO CONSOLE (ESC) ] ").clicked() {
+                                    exit_to_dash = true;
+                                }
+                            });
+                        });
+                    });
+
+                if exit_to_dash {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    self.phase = AppPhase::Dashboard;
+                } else if proceed_to_cal {
+                    self.phase = AppPhase::Measuring {
+                        patches: build_calibration_patches(),
+                        current_index: 0,
+                        patch_shown_at: Instant::now(),
+                        awaiting_read: false,
+                        readings: Vec::with_capacity(14),
+                    };
+                    ctx.request_repaint();
+                } else if (!*paused && last_poll.elapsed() >= OSD_POLL_INTERVAL)
+                    || trigger_manual_read
+                {
+                    if let Some(s) = &self.session {
+                        if let Ok(r) = s.measure() {
+                            *reading = Some(r);
+                            self.last_single_read = Some(r);
+                            *read_count += 1;
+                        }
+                    }
+                    *last_poll = Instant::now();
+                    if !*paused {
+                        ctx.request_repaint_after(OSD_POLL_INTERVAL);
+                    }
+                } else if !*paused {
+                    ctx.request_repaint_after(OSD_POLL_INTERVAL - last_poll.elapsed());
                 }
             }
 
