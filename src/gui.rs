@@ -6,7 +6,7 @@ use eframe::egui;
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
     bt1886_params, eotf_target_luminance, generate_profile_from_measurements,
-    CalibrationMeasurements, EotfConfig,
+    CalibrationMeasurements, EotfConfig, VcgtSummary,
 };
 
 /// Time to let the display panel settle on a new color patch before triggering the sensor read.
@@ -169,6 +169,7 @@ enum AppPhase {
     /// Completed calibration telemetry report.
     Report {
         measurements: CalibrationMeasurements,
+        vcgt_summary: VcgtSummary,
         saved_paths: Vec<PathBuf>,
     },
 }
@@ -258,13 +259,14 @@ impl YutaniApp {
         };
 
         match generate_profile_from_measurements(&measurements, self.eotf) {
-            Ok(saved_paths) => {
+            Ok((saved_paths, vcgt_summary)) => {
                 self.status_log = format!(
-                    "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S)",
+                    "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S) WITH 3x1024 VCGT",
                     saved_paths.len()
                 );
                 self.phase = AppPhase::Report {
                     measurements,
+                    vcgt_summary,
                     saved_paths,
                 };
             }
@@ -579,6 +581,7 @@ impl eframe::App for YutaniApp {
 
             AppPhase::Report {
                 measurements,
+                vcgt_summary,
                 saved_paths,
             } => {
                 let mut back_to_dash = false;
@@ -615,6 +618,23 @@ impl eframe::App for YutaniApp {
                     ui.label(format!(
                         "PRIMARIES (xy)  : R({:.4}, {:.4})  G({:.4}, {:.4})  B({:.4}, {:.4})",
                         rx, ry, gx, gy, bx, by
+                    ));
+                    ui.label(format!(
+                        "D65 VCGT GAINS  : R = {:.1}% | G = {:.1}% | B = {:.1}% (Inversion: {})",
+                        vcgt_summary.d65_rgb_gains[0] * 100.0,
+                        vcgt_summary.d65_rgb_gains[1] * 100.0,
+                        vcgt_summary.d65_rgb_gains[2] * 100.0,
+                        if vcgt_summary.used_measured_inversion {
+                            "ACTIVE"
+                        } else {
+                            "BASELINE FALLBACK"
+                        }
+                    ));
+                    ui.label(format!(
+                        "VCGT @ 50% IN   : R_out = {:.3} | G_out = {:.3} | B_out = {:.3}",
+                        vcgt_summary.midtone_50_vcgt[0],
+                        vcgt_summary.midtone_50_vcgt[1],
+                        vcgt_summary.midtone_50_vcgt[2]
                     ));
 
                     ui.add_space(10.0);
